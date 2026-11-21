@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Staff login · 3D Print Queue{% endblock %}
+{% block body %}
+<div class="card" style="max-width:380px">
+  <h2>Staff login</h2>
+  {% if configured %}
+  <form method="post">
+    <label>Password</label>
+    <input type="password" name="password" autocomplete="current-password">
+    <div style="margin-top:12px"><button class="primary">Log in</button></div>
+  </form>
+  {% else %}
+  <p>No staff password is set. Put <code>ADMIN_PASSWORD=...</code> in <code>config.env</code> and restart the queue.</p>
+  {% endif %}
+</div>
+{% endblock %}

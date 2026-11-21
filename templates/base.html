@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#ffffff">
+<title>{% block title %}3D Print Queue{% endblock %}</title>
+<style>
+  :root {
+    --bg: #f4f5f7; --surface: #fff; --line: #dfe1e5; --ink: #1d1f23; --muted: #5d6370;
+    --accent: #1d1f23; --focus: #2563eb;
+    /* state colours: tint + ink for calm states, solid for states that need action */
+    --ok-tint: #e7f5ec; --ok-ink: #135c2a;
+    --busy-tint: #e8f0fc; --busy-ink: #19468c; --busy: #2b63c6;
+    --warn: #a84f00; --warn-tint: #fff4e8; --warn-line: #efc28f;
+    --bad: #b42318; --bad-tint: #fdeceb;
+    --idle-tint: #eef0f3;
+    --r: 8px;
+  }
+  * { box-sizing: border-box; }
+  ::selection { background: #cfe0ff; color: var(--ink); }
+  body { margin: 0; background: var(--bg); color: var(--ink); font-size: 16px; line-height: 1.45;
+         font-family: system-ui, "Segoe UI", "Leelawadee UI", "Noto Sans Thai", Tahoma, sans-serif; }
+  a { color: inherit; text-underline-offset: 3px; }
+  :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 4px; }
+
+  header { background: var(--surface); border-bottom: 1px solid var(--line); }
+  .bar-in { max-width: 1100px; margin: 0 auto; padding: 12px 16px; display: flex; gap: 12px;
+            justify-content: space-between; align-items: center; }
+  header h1 { font-size: 18px; margin: 0; font-weight: 650; }
+  header h1 a { text-decoration: none; }
+  header nav { display: flex; gap: 12px; align-items: center; font-size: 15px; color: var(--muted); }
+  main { max-width: 1100px; margin: 0 auto; padding: 16px; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr)); gap: 16px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 16px; min-width: 0; }
+  .card h2 { margin: 0 0 10px; font-size: 18px; font-weight: 650; }
+  h3 { font-size: 15px; margin: 20px 0 6px; font-weight: 650; }
+
+  /* printer state */
+  .state { border-radius: 6px; padding: 10px 12px; margin: 0 0 12px; font-weight: 650; border: 1px solid transparent; }
+  .state p { margin: 2px 0 0; font-weight: 400; font-size: 15px; }
+  .s-ready  { background: var(--ok-tint);   color: var(--ok-ink); }
+  .s-busy   { background: var(--busy-tint); color: var(--busy-ink); }
+  .s-paused { background: var(--idle-tint); color: var(--muted); }
+  .s-clear  { background: var(--warn); color: #fff; }
+  .s-error  { background: var(--bad);  color: #fff; }
+
+  .meter { height: 8px; background: var(--idle-tint); border-radius: 4px; overflow: hidden; margin: 8px 0 4px; }
+  .meter div { height: 100%; background: var(--busy); transition: width .25s ease-out; }
+  .num { font-variant-numeric: tabular-nums; }
+  .muted { color: var(--muted); font-size: 14px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; white-space: nowrap; }
+  td.acts { white-space: nowrap; text-align: right; }
+  td.when { white-space: nowrap; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 13px; font-weight: 600; white-space: nowrap; }
+  .p-done { background: var(--ok-tint); color: var(--ok-ink); }
+  .p-stopped { background: var(--idle-tint); color: var(--muted); }
+  .p-failed { background: var(--bad-tint); color: var(--bad); }
+
+  .flash { padding: 10px 12px; border-radius: 6px; margin-bottom: 12px; }
+  .flash.ok { background: var(--ok-tint); color: var(--ok-ink); }
+  .flash.bad { background: var(--bad-tint); color: var(--bad); }
+  .offline { display: none; background: var(--bad-tint); color: var(--bad); padding: 8px 12px; border-radius: 6px; margin-bottom: 12px; }
+  .offline.on { display: block; }
+
+  form.inline { display: inline; }
+  button { font: inherit; font-size: 15px; min-height: 40px; padding: 8px 14px; border-radius: 6px;
+           border: 1px solid #b9bdc5; background: var(--surface); color: var(--ink); cursor: pointer;
+           transition: background-color .15s ease-out, border-color .15s ease-out; }
+  button:hover { background: #f2f3f5; border-color: #9aa0aa; }
+  button:active { background: #e6e8eb; }
+  button:disabled { opacity: .6; cursor: progress; }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  button.primary:hover { background: #3a3d44; }
+  button.danger { color: var(--bad); border-color: #e5a29c; }
+  button.danger:hover { background: var(--bad-tint); }
+  button.small { min-height: 36px; padding: 4px 10px; font-size: 14px; }
+  button.icon { min-width: 36px; padding: 4px; display: inline-flex; align-items: center; justify-content: center; }
+  button.block { width: 100%; min-height: 48px; }
+  svg.i { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+
+  label { display: block; margin: 12px 0 4px; font-size: 14px; font-weight: 500; }
+  input[type=text], input[type=password], select { width: 100%; min-height: 44px; padding: 8px 10px; font: inherit;
+           border: 1px solid #b9bdc5; border-radius: 6px; background: var(--surface); color: var(--ink); }
+  input[type=file] { font: inherit; font-size: 15px; max-width: 100%; }
+  .hint { font-weight: 400; color: var(--muted); }
+
+  .clearbox { background: var(--warn-tint); border: 1px solid var(--warn-line); border-radius: 6px; padding: 12px; margin-top: 12px; }
+  .clearbox .check { display: flex; gap: 10px; align-items: flex-start; font-weight: 400; font-size: 15px; margin: 8px 0 10px; }
+  .clearbox .check input { width: 20px; height: 20px; margin: 1px 0 0; flex: none; accent-color: var(--warn); }
+  img.cam { width: 100%; aspect-ratio: 4 / 3; object-fit: cover; background: var(--idle-tint); border-radius: 6px; margin-top: 12px; display: block; }
+  code { font-size: 14px; }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+</style>
+</head>
+<body>
+<header><div class="bar-in">
+  <h1><a href="{{ url_for('index') }}">3D Print Queue</a></h1>
+  <nav>{% if is_admin() %}<a href="{{ url_for('admin') }}">Staff page</a>
+    <form class="inline" method="post" action="{{ url_for('logout') }}"><button class="small">Log out</button></form>
+    {% else %}<a href="{{ url_for('admin') }}">Staff login</a>{% endif %}</nav>
+</div></header>
+<main>
+  {% with msgs = get_flashed_messages(with_categories=true) %}
+    {% for cat, m in msgs %}<div class="flash {{ cat }}" role="{{ 'alert' if cat == 'bad' else 'status' }}">{{ m }}</div>{% endfor %}
+  {% endwith %}
+  <div class="offline" id="offline" role="alert">Lost contact with the queue server. Retrying every 5 seconds…</div>
+  {% block body %}{% endblock %}
+</main>
+<script>
+  // Refresh the printer cards every 5 s, but never while someone is using a control inside them.
+  const box = document.getElementById('printers');
+  const offline = document.getElementById('offline');
+  if (box) setInterval(async () => {
+    const a = document.activeElement;
+    if (a && a !== document.body && box.contains(a)) return;
+    try {
+      const r = await fetch('{{ url_for("partial") }}', { cache: 'no-store' });
+      if (!r.ok) throw new Error(r.status);
+      box.innerHTML = await r.text();
+      offline.classList.remove('on');
+      fillName();
+    } catch (e) { offline.classList.add('on'); }
+  }, 5000);
+
+  // Remember name and student ID on this device so students type them once.
+  function load(k) { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } }
+  function save(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+  function fillName() {
+    document.querySelectorAll('input[name=who], input[name=name]').forEach(i => { if (!i.value) i.value = load('pq-name'); });
+    document.querySelectorAll('input[name=student_id]').forEach(i => { if (!i.value) i.value = load('pq-sid'); });
+  }
+  fillName();
+  document.addEventListener('submit', e => {
+    const f = e.target;
+    const n = f.querySelector('input[name=name], input[name=who]');
+    const s = f.querySelector('input[name=student_id]');
+    if (n && n.value) save('pq-name', n.value.trim());
+    if (s && s.value) save('pq-sid', s.value.trim());
+    const b = f.querySelector('button[data-busy]');
+    if (b) { b.disabled = true; b.textContent = b.dataset.busy; }
+  });
+  // Back/forward cache can restore a disabled button; re-enable it.
+  window.addEventListener('pageshow', () => document.querySelectorAll('button[data-busy]').forEach(b => {
+    b.disabled = false; if (b.dataset.label) b.textContent = b.dataset.label; }));
+</script>
+</body>
+</html>

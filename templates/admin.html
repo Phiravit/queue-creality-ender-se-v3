@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Staff · 3D Print Queue{% endblock %}
+{% block body %}
+<p class="muted">Staff view: you can reorder or remove any job, cancel any queue print, pause a queue and mark a plate clear.</p>
+<div id="printers">{% include "_printers.html" %}</div>
+
+<div class="card" style="margin-top:16px">
+  <h2>Event log</h2>
+  <table>
+    <tr><th>Time</th><th>Printer</th><th>What happened</th></tr>
+    {% for e in events %}
+    <tr><td class="muted">{{ fmt_time(e.ts) }}</td><td>{{ e.printer }}</td><td>{{ e.msg }}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% endblock %}

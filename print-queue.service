@@ -1,0 +1,15 @@
+[Unit]
+Description=3D print queue (web page in front of OctoPrint)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Change User and the three /home/pi paths to your Pi login user.
+User=pi
+WorkingDirectory=/home/pi/print-queue
+ExecStart=/home/pi/print-queue/venv/bin/python app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

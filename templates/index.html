@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block body %}
+<div id="printers">{% include "_printers.html" %}</div>
+
+<section class="card" style="margin-top:16px; max-width:560px" aria-labelledby="add-h">
+  <h2 id="add-h">Add a print to the queue</h2>
+  <form method="post" action="{{ url_for('submit') }}" enctype="multipart/form-data">
+    <label for="f-printer">Printer</label>
+    <select id="f-printer" name="printer" required>
+      {% for d in printers %}<option value="{{ d.p.id }}">{{ d.p.name }}</option>{% endfor %}
+    </select>
+    <label for="f-name">Your name</label>
+    <input type="text" id="f-name" name="name" required maxlength="60" autocomplete="name">
+    <label for="f-sid">Student ID</label>
+    <input type="text" id="f-sid" name="student_id" required maxlength="20" inputmode="numeric" autocomplete="off">
+    <label for="f-file">G-code file <span class="hint">(sliced for this printer, up to {{ max_mb }} MB)</span></label>
+    <input type="file" id="f-file" name="file" accept=".gcode,.gco,.g" required>
+    <label for="f-note">Note <span class="hint">(optional, e.g. filament colour)</span></label>
+    <input type="text" id="f-note" name="note" maxlength="200">
+    <div style="margin-top:14px"><button class="primary" data-busy="Uploading…" data-label="Add to queue">Add to queue</button></div>
+  </form>
+  <p class="muted">When your print is done, take it off the plate, then press
+    <b>Plate is clear</b> on this page so the next person's print can start.
+    You can remove or cancel your own job from this browser.</p>
+</section>
+{% endblock %}
