@@ -24,7 +24,21 @@ the button, so staff can check from anywhere.
 | Waiting for the plate to be cleared (orange) | A print ended. Remove it, then press **Plate is clear**. |
 | Printer error / Offline (red) | What OctoPrint reports (e.g. thermal runaway). Students can't unlock it; staff fix it. |
 
-Students can only remove or cancel their **own** jobs (remembered by their browser).
+## Sign-in
+
+Students sign in once per device with their name and a university email ending in
+`@mail.kmutt.ac.th`, `@ad.sit.kmutt.ac.th` or `@kmutt.ac.th` (set in
+`ALLOWED_EMAIL_DOMAINS`). They stay signed in for about four months. Jobs belong to
+the email, so a student can cancel their print from any device they're signed in on.
+
+The queue only checks the domain; it doesn't email a code. That's deliberate for a
+closed lab on the KMUTT network: it's light, and it records who printed what. Anyone
+who types someone else's email could act as them. Note that the KMUTT network isn't
+SIT-only, so for SIT students only, remove `kmutt.ac.th` from the list.
+
+## Jobs
+
+Students can only remove or cancel their **own** jobs.
 A print started directly in OctoPrint (not through the queue) is still detected: the
 printer shows as busy and locks afterwards.
 
@@ -45,36 +59,23 @@ the printer reports a problem, and read the event log.
 
 ## Install on the Raspberry Pi
 
-Run these on the Pi (SSH in as you normally do). Replace `<pi-user>` and `<pi-ip>` with your Pi login and address; the service file assumes the user `pi`, so change
-them if your user is different.
-
-1. Copy this folder to the Pi, e.g. from your laptop:
-   `scp -r print-queue <pi-user>@<pi-ip>:~/` (only `app.py`, `templates/`,
-   `requirements.txt`, `config.example.env` and `print-queue.service` are needed).
-2. Install:
-   ```bash
-   cd ~/print-queue
-   python3 -m venv venv
-   venv/bin/pip install -r requirements.txt
-   cp config.example.env config.env
-   nano config.env
-   ```
-3. Fill in `config.env`:
+1. Copy the app to the Pi from your laptop (you type the Pi password):
+   `scp -r print-queue <pi-user>@<pi-ip>:~/`
+   Re-running this later updates the code but never touches `config.env` or `data/` on the Pi.
+2. Run the installer on the Pi (it asks for the sudo password when needed):
+   `ssh -t <pi-user>@<pi-ip> "bash ~/print-queue/install.sh"`
+   It creates a Python venv, installs the packages, creates `config.env` and opens it in
+   nano the first time, installs the `print-queue` systemd service for your user, starts
+   it and prints the last log lines.
+3. In `config.env` fill in:
    - `ADMIN_PASSWORD`: a new staff password (not the OctoPrint or Pi one).
    - `PRINTER1_APIKEY` and `PRINTER2_APIKEY`: in each OctoPrint (5001 and 5002), log in as
      its admin, then **Settings > Application Keys > Generate**. (Or **Settings > API >
      Global API Key**.) Each printer has its own key.
    - `PRINTERx_URL` stays `http://127.0.0.1:5001` / `5002` when the queue runs on the same Pi.
-   - Discord (optional): see below.
-4. Try it: `venv/bin/python app.py`, then open `http://<pi-ip>:8000` from a lab
-   computer. Press Ctrl+C to stop.
-5. Make it start on boot:
-   ```bash
-   sudo cp print-queue.service /etc/systemd/system/
-   sudo systemctl daemon-reload
-   sudo systemctl enable --now print-queue
-   journalctl -u print-queue -f     # live log
-   ```
+   - `PUBLIC_URL` and Discord (optional): see below.
+4. After editing `config.env` later: `sudo systemctl restart print-queue`.
+   Live log: `journalctl -u print-queue -f`.
 
 After every restart the printers start in **Waiting for the plate to be cleared**.
 That's deliberate.
@@ -114,7 +115,7 @@ change those passwords so only staff use OctoPrint directly.
 ## Testing without the real printers
 
 `dev/fake_octoprint.py` pretends to be OctoPrint, and `dev/e2e_test.py` runs the
-whole flow against two fakes (13 checks, no real printer touched):
+whole flow against two fakes (14 checks, no real printer touched):
 
 ```bash
 pip install -r requirements.txt
@@ -126,8 +127,9 @@ python dev/e2e_test.py
 | File | What it is |
 |---|---|
 | `app.py` | Web app, OctoPrint poller, queue rules, Discord alerts |
-| `templates/` | The pages (student page, staff page, login) |
+| `templates/` | The pages (student page, sign-in, staff page, staff login) |
 | `config.example.env` | Settings template; copy to `config.env` |
 | `print-queue.service` | systemd unit to start on boot |
+| `install.sh` | Installer/updater to run on the Pi |
 | `data/` | Created at runtime: SQLite database and uploaded files |
 | `dev/` | Fake OctoPrint and the end-to-end test |

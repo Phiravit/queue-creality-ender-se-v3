@@ -69,8 +69,6 @@
           <b>Only do this while you're standing at the printer.</b>
           <label class="check"><input type="checkbox" name="confirm" value="yes" required>
             <span>I took the print off and the plate is completely empty: no parts, strings or purge lines.</span></label>
-          <label for="who-{{ p.id }}">Your name</label>
-          <input type="text" id="who-{{ p.id }}" name="who" required maxlength="60" autocomplete="name">
           <div style="margin-top:10px"><button class="primary block">Plate is clear, start the next job</button></div>
         {% endif %}
       </form>
@@ -98,7 +96,7 @@
       {% for j, wait in d.queue %}
       <tr>
         <td class="num">{{ loop.index }}</td>
-        <td><b>{{ j.student_name }}</b>{% if is_admin() %} <span class="muted num">({{ j.student_id }})</span>{% endif %}<br>
+        <td><b>{{ j.student_name }}</b>{% if is_admin() %} <span class="muted">({{ j.email or j.student_id }})</span>{% endif %}<br>
             <span class="muted">{{ j.filename }}{% if j.note %} · {{ j.note }}{% endif %}</span></td>
         <td class="num when">{% if row.lock == 'NEEDS_CLEAR' and loop.first %}After the plate is cleared{% else %}In about {{ fmt_dur(wait) }}{% endif %}<br>
             <span class="muted">{{ fmt_dur(j.est_seconds) }} print</span></td>

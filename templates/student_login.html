@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Sign in · 3D Print Queue{% endblock %}
+{% block body %}
+<section class="card" style="max-width:420px; margin: 24px auto 0" aria-labelledby="in-h">
+  <h2 id="in-h">Sign in to the print queue</h2>
+  <p class="muted" style="margin-top:0">For SIT and KMUTT students. You only do this once on each device.</p>
+  <form method="post" action="{{ url_for('login') }}">
+    <label for="l-name">Your name</label>
+    <input type="text" id="l-name" name="name" value="{{ name }}" required maxlength="60" autocomplete="name">
+    <label for="l-email">University email</label>
+    <input type="text" id="l-email" name="email" value="{{ email }}" required maxlength="120"
+           inputmode="email" autocomplete="email" autocapitalize="none" spellcheck="false"
+           placeholder="you@{{ allowed_domains[0] }}">
+    <p class="muted" style="margin:6px 0 0">Ends in {% for d in allowed_domains %}<b>@{{ d }}</b>{{ ", " if not loop.last }}{% endfor %}</p>
+    <div style="margin-top:14px"><button class="primary block">Sign in</button></div>
+  </form>
+</section>
+{% endblock %}

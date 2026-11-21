@@ -21,7 +21,7 @@ import time
 import uuid
 import logging
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import requests
 from flask import (Flask, Response, abort, flash, redirect, render_template,
@@ -61,6 +61,10 @@ ALLOWED_EXT = (".gcode", ".gco", ".g")
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
 DISCORD_STAFF_ROLE = os.environ.get("DISCORD_STAFF_ROLE_ID", "")
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
+# Students sign in with an email on one of these domains (exact match after the @).
+ALLOWED_DOMAINS = [d.strip().lower().lstrip("@") for d in os.environ.get(
+    "ALLOWED_EMAIL_DOMAINS", "mail.kmutt.ac.th,ad.sit.kmutt.ac.th,kmutt.ac.th").split(",") if d.strip()]
+EMAIL_RE = re.compile(r"^[a-z0-9._%+-]+@([a-z0-9-]+(\.[a-z0-9-]+)+)$")
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -91,7 +95,8 @@ class Printer:
         self.url = url.rstrip("/")
         self.key = key
         self.snapshot = snapshot
-        self.bad_polls = 0
+        self.bad_polls = 0      # consecutive polls with any problem
+        self.unreach_polls = 0  # consecutive polls where OctoPrint did not answer
 
     def _h(self):
         # X-Api-Key for OctoPrint 1.x, Bearer for 2.x. Sending both is harmless.
@@ -107,6 +112,7 @@ class Printer:
             rp = requests.get(self.url + "/api/printer", headers=self._h(), timeout=5)
         except requests.RequestException as e:
             st["error"] = str(e.__class__.__name__)
+            log.warning("printer %s: no answer from OctoPrint (%s)", self.id, st["error"])
             return st
         if rj.status_code in (401, 403):
             st["text"] = "OctoPrint rejected the API key"
@@ -221,6 +227,9 @@ def init_db():
         CREATE TABLE IF NOT EXISTS events(
             id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, printer TEXT, msg TEXT);
         """)
+        cols = [r["name"] for r in c.execute("PRAGMA table_info(jobs)")]
+        if "email" not in cols:
+            c.execute("ALTER TABLE jobs ADD COLUMN email TEXT")
         for pid in PRINTERS:
             c.execute("INSERT OR IGNORE INTO printers(id, lock, lock_reason) VALUES(?,?,?)",
                       (pid, "NEEDS_CLEAR", "Queue just started: check the plate is empty."))
@@ -274,9 +283,10 @@ def poll_printer(p):
     start_job = None
     bad = st["kind"] in ("unreachable", "offline", "error")
     p.bad_polls = p.bad_polls + 1 if bad else 0
-    # One slow or failed poll must not flash the page red: keep showing the last
-    # good reading until the problem has lasted a few polls. Errors show at once.
-    if st["kind"] == "error" or not bad or p.bad_polls >= BAD_POLLS_BEFORE_LOCK:
+    p.unreach_polls = p.unreach_polls + 1 if st["kind"] == "unreachable" else 0
+    # A single request that gets no answer must not replace what the page shows
+    # (including a real printer error): only show "can't reach" once it lasts.
+    if st["kind"] != "unreachable" or p.unreach_polls >= BAD_POLLS_BEFORE_LOCK:
         LIVE[p.id] = st
 
     with tx() as c:
@@ -284,7 +294,9 @@ def poll_printer(p):
         lock = row["lock"]
 
         if bad:
-            if st["kind"] != "error" and p.bad_polls < BAD_POLLS_BEFORE_LOCK:
+            if st["kind"] == "unreachable" and p.unreach_polls < BAD_POLLS_BEFORE_LOCK:
+                return
+            if st["kind"] == "offline" and p.bad_polls < BAD_POLLS_BEFORE_LOCK:
                 return
             why = "%s: %s" % (st["text"], st["error"]) if st["error"] else st["text"]
             if st["kind"] == "unreachable":
@@ -296,7 +308,7 @@ def poll_printer(p):
                            staff=True)
                     set_lock(c, p.id, "NEEDS_CLEAR",
                              "The queue lost contact with this printer. Check the plate.")
-                elif p.bad_polls == BAD_POLLS_BEFORE_LOCK:
+                elif p.unreach_polls == BAD_POLLS_BEFORE_LOCK:
                     event(c, p.id, "Lost contact with OctoPrint: " + why)
                 return
             if lock == "BUSY":
@@ -437,8 +449,26 @@ def is_admin():
     return bool(session.get("admin"))
 
 
+def user_email():
+    return session.get("email")
+
+
+def owns(job):
+    return bool(user_email()) and job["email"] == user_email()
+
+
 def my_jobs():
-    return set(session.get("mine", []))
+    """Ids of this student's queued or printing jobs (on any device)."""
+    if not user_email():
+        return set()
+    with tx() as c:
+        return {r["id"] for r in c.execute(
+            "SELECT id FROM jobs WHERE email=? AND status IN ('queued','printing')", (user_email(),))}
+
+
+def email_ok(email):
+    m = EMAIL_RE.match(email)
+    return bool(m) and m.group(1) in ALLOWED_DOMAINS
 
 
 def view_data():
@@ -482,7 +512,39 @@ def _secret():
 
 
 app.secret_key = _secret()
-app.jinja_env.globals.update(fmt_dur=fmt_dur, fmt_time=fmt_time, is_admin=is_admin)
+app.permanent_session_lifetime = timedelta(days=120)   # stay signed in for a semester
+app.jinja_env.globals.update(fmt_dur=fmt_dur, fmt_time=fmt_time, is_admin=is_admin,
+                             user_email=user_email, user_name=lambda: session.get("name"),
+                             allowed_domains=ALLOWED_DOMAINS)
+
+OPEN_ENDPOINTS = {"login", "admin", "logout", "static"}
+
+
+@app.before_request
+def require_login():
+    if request.endpoint in OPEN_ENDPOINTS or user_email() or is_admin():
+        return None
+    if request.endpoint == "partial":
+        return "", 401          # the page script reloads and lands on the login page
+    return redirect(url_for("login"))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()[:120]
+        name = " ".join(request.form.get("name", "").split())[:60]
+        if not name:
+            flash("Enter your name.", "bad")
+        elif not email_ok(email):
+            flash("Use your KMUTT or SIT email (ending in %s)." %
+                  " or ".join("@" + d for d in ALLOWED_DOMAINS), "bad")
+        else:
+            session.permanent = True
+            session["email"], session["name"] = email, name
+            return redirect(url_for("index"))
+        return render_template("student_login.html", email=email, name=name)
+    return render_template("student_login.html", email="", name="")
 
 
 @app.errorhandler(413)
@@ -505,14 +567,12 @@ def partial():
 @app.post("/submit")
 def submit():
     pid = request.form.get("printer", "")
-    name = request.form.get("name", "").strip()[:60]
-    sid = request.form.get("student_id", "").strip()[:20]
+    name, email = session.get("name") or "Staff", user_email() or "staff"
+    sid = email.split("@")[0][:20]
     note = request.form.get("note", "").strip()[:200]
     f = request.files.get("file")
     if pid not in PRINTERS:
         flash("Pick a printer.", "bad")
-    elif not name or not sid:
-        flash("Enter your name and student ID.", "bad")
     elif not f or not f.filename:
         flash("Choose a G-code file.", "bad")
     elif not f.filename.lower().endswith(ALLOWED_EXT):
@@ -523,13 +583,13 @@ def submit():
         f.save(path)
         est = estimate_seconds(path)
         with tx() as c:
-            cur = c.execute("INSERT INTO jobs(printer, student_name, student_id, note, filename, "
-                            "stored, est_seconds, sort, created) VALUES(?,?,?,?,?,?,?,?,?)",
-                            (pid, name, sid, note, f.filename[:120], stored, est,
+            cur = c.execute("INSERT INTO jobs(printer, student_name, student_id, email, note, "
+                            "filename, stored, est_seconds, sort, created) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                            (pid, name, sid, email, note, f.filename[:120], stored, est,
                              time.time(), time.time()))
             jid = cur.lastrowid
-            event(c, pid, "Job #%d queued by %s (%s): %s" % (jid, name, sid, f.filename))
-        session["mine"] = list(my_jobs() | {jid})
+            event(c, pid, "Job #%d queued by %s (%s): %s" % (jid, name, email, f.filename))
         flash("Added to the queue for %s. Job #%d." % (PRINTERS[pid].name, jid), "ok")
     return redirect(url_for("index"))
 
@@ -545,7 +605,7 @@ def _job_or_404(jid):
 @app.post("/job/<int:jid>/remove")
 def remove_job(jid):
     j = _job_or_404(jid)
-    if not (is_admin() or jid in my_jobs()):
+    if not (is_admin() or owns(j)):
         abort(403)
     if j["status"] == "queued":
         with tx() as c:
@@ -560,7 +620,7 @@ def remove_job(jid):
 def job_cmd(jid, cmd):
     """Cancel / pause / resume a print. Owner of the job or staff only."""
     j = _job_or_404(jid)
-    if not (is_admin() or jid in my_jobs()):
+    if not (is_admin() or owns(j)):
         abort(403)
     p = PRINTERS[j["printer"]]
     payload = {"cancel": {"command": "cancel"},
@@ -581,11 +641,10 @@ def job_cmd(jid, cmd):
 @app.post("/printer/<pid>/clear")
 def clear_plate(pid):
     p = PRINTERS.get(pid) or abort(404)
-    who = request.form.get("who", "").strip()[:60]
-    if not is_admin() and (not who or request.form.get("confirm") != "yes"):
-        flash("Type your name and tick the box to confirm the plate is empty.", "bad")
+    if not is_admin() and request.form.get("confirm") != "yes":
+        flash("Tick the box to confirm the plate is empty.", "bad")
         return redirect(request.referrer or url_for("index"))
-    who = who or "staff"
+    who = "%s (%s)" % (session["name"], user_email()) if user_email() else "staff"
     with tx() as c:
         row = c.execute("SELECT * FROM printers WHERE id=?", (pid,)).fetchone()
         if row["lock"] != "NEEDS_CLEAR":
@@ -627,13 +686,13 @@ def admin():
         return render_template("login.html", configured=bool(ADMIN_PASSWORD))
     with tx() as c:
         events = c.execute("SELECT * FROM events ORDER BY id DESC LIMIT 150").fetchall()
-    return render_template("admin.html", printers=view_data(), events=events, mine=set())
+    return render_template("admin.html", printers=view_data(), events=events, mine=my_jobs())
 
 
-@app.post("/admin/logout")
+@app.post("/logout")
 def logout():
-    session.pop("admin", None)
-    return redirect(url_for("index"))
+    session.clear()
+    return redirect(url_for("login"))
 
 
 @app.post("/admin/printer/<pid>/<action>")

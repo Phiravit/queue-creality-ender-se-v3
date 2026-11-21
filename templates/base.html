@@ -102,9 +102,11 @@
 <body>
 <header><div class="bar-in">
   <h1><a href="{{ url_for('index') }}">3D Print Queue</a></h1>
-  <nav>{% if is_admin() %}<a href="{{ url_for('admin') }}">Staff page</a>
-    <form class="inline" method="post" action="{{ url_for('logout') }}"><button class="small">Log out</button></form>
-    {% else %}<a href="{{ url_for('admin') }}">Staff login</a>{% endif %}</nav>
+  <nav>
+    {% if user_email() %}<span title="{{ user_email() }}">{{ user_name() }}</span>{% endif %}
+    {% if is_admin() %}<a href="{{ url_for('admin') }}">Staff page</a>{% else %}<a href="{{ url_for('admin') }}">Staff</a>{% endif %}
+    {% if user_email() or is_admin() %}<form class="inline" method="post" action="{{ url_for('logout') }}"><button class="small">Sign out</button></form>{% endif %}
+  </nav>
 </div></header>
 <main>
   {% with msgs = get_flashed_messages(with_categories=true) %}
@@ -122,28 +124,16 @@
     if (a && a !== document.body && box.contains(a)) return;
     try {
       const r = await fetch('{{ url_for("partial") }}', { cache: 'no-store' });
+      if (r.status === 401) { location.reload(); return; }
       if (!r.ok) throw new Error(r.status);
       box.innerHTML = await r.text();
       offline.classList.remove('on');
-      fillName();
     } catch (e) { offline.classList.add('on'); }
   }, 5000);
 
-  // Remember name and student ID on this device so students type them once.
-  function load(k) { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } }
-  function save(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
-  function fillName() {
-    document.querySelectorAll('input[name=who], input[name=name]').forEach(i => { if (!i.value) i.value = load('pq-name'); });
-    document.querySelectorAll('input[name=student_id]').forEach(i => { if (!i.value) i.value = load('pq-sid'); });
-  }
-  fillName();
+  // Show "Uploading…" and block double submits on long uploads.
   document.addEventListener('submit', e => {
-    const f = e.target;
-    const n = f.querySelector('input[name=name], input[name=who]');
-    const s = f.querySelector('input[name=student_id]');
-    if (n && n.value) save('pq-name', n.value.trim());
-    if (s && s.value) save('pq-sid', s.value.trim());
-    const b = f.querySelector('button[data-busy]');
+    const b = e.target.querySelector('button[data-busy]');
     if (b) { b.disabled = true; b.textContent = b.dataset.busy; }
   });
   // Back/forward cache can restore a disabled button; re-enable it.

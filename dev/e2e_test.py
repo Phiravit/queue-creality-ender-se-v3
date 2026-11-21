@@ -17,9 +17,9 @@ F1, F2 = "http://127.0.0.1:5101", "http://127.0.0.1:5102"
 procs = []
 
 
-def start(args, env=None):
-    p = subprocess.Popen([sys.executable] + args, env=env, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.STDOUT)
+def start(args, env=None, log=None):
+    out = open(log, "w") if log else subprocess.DEVNULL
+    p = subprocess.Popen([sys.executable] + args, env=env, stdout=out, stderr=subprocess.STDOUT)
     procs.append(p)
 
 
@@ -59,6 +59,12 @@ def submit(s, printer, name, path):
     return r
 
 
+def login(name, email):
+    s = requests.Session()
+    s.post(Q + "/login", data={"name": name, "email": email})
+    return s
+
+
 def clear(s, printer, who="Tester"):
     return s.post(Q + "/printer/%s/clear" % printer, data={"who": who, "confirm": "yes"})
 
@@ -72,7 +78,7 @@ env = dict(os.environ, QUEUE_CONFIG=os.path.join(data, "none.env"), DATA_DIR=dat
 start([os.path.join(HERE, "fake_octoprint.py"), "5101", "KEY1"])
 start([os.path.join(HERE, "fake_octoprint.py"), "5102", "KEY2"])
 time.sleep(1.5)
-start([APP], env=env)
+start([APP], env=env, log=os.path.join(data, "app.log"))
 
 
 def _up():
@@ -85,7 +91,24 @@ def _up():
 ok = []
 try:
     wait_until(_up, "queue web server")
-    alice, bob, carol = requests.Session(), requests.Session(), requests.Session()
+    # 0. Sign-in: KMUTT/SIT domains only, everything else needs sign-in first.
+    anon = requests.Session()
+    r = anon.get(Q + "/", allow_redirects=False)
+    assert r.status_code == 302 and "/login" in r.headers["Location"]
+    assert anon.get(Q + "/partial").status_code == 401
+    assert anon.post(Q + "/submit", data={"printer": "1"}, allow_redirects=False).status_code == 302
+    for bad in ("x@gmail.com", "x@mail.kmutt.ac.th.evil.com", "x@sub.mail.kmutt.ac.th",
+                "x@kmutt.ac.th@gmail.com", "not-an-email", "x@evilkmutt.ac.th"):
+        r = anon.post(Q + "/login", data={"name": "X", "email": bad})
+        assert "Use your KMUTT or SIT email" in r.text, bad
+        assert anon.get(Q + "/", allow_redirects=False).status_code == 302, bad
+    assert "Enter your name." in anon.post(Q + "/login", data={"name": "  ", "email": "a@kmutt.ac.th"}).text
+    assert anon.get(Q + "/", allow_redirects=False).status_code == 302
+    alice = login("Alice", "Alice.W@MAIL.KMUTT.AC.TH")
+    bob = login("Bob", "65130500001@ad.sit.kmutt.ac.th")
+    carol = login("Carol", "carol@kmutt.ac.th")
+    assert "alice.w@mail.kmutt.ac.th" in alice.get(Q + "/").text, "email stored lower-case"
+    ok.append("sign-in: only @mail.kmutt.ac.th / @ad.sit.kmutt.ac.th / @kmutt.ac.th; pages locked otherwise")
 
     # 1. Fresh start is locked: a job must not start before someone clears the plate.
     submit(alice, "1", "Alice", gcode("alice.gcode", 90))
@@ -103,6 +126,8 @@ try:
     assert "30m" in page, "slicer estimate"
     assert "Cancel print" in page, "owner cancel"
     assert "Cancel print" not in carol.get(Q + "/").text, "other students must not see cancel"
+    alice_phone = login("Alice", "alice.w@mail.kmutt.ac.th")
+    assert "Cancel print" in alice_phone.get(Q + "/").text, "same email on another device owns the job"
     ok.append("plate clear -> next job auto-starts; slicer time shown; only owner sees cancel")
 
     # 3. When the print finishes, the printer locks again and job 2 waits.
@@ -152,7 +177,10 @@ try:
     requests.post(F2 + "/fake/error")
     wait_until(lambda: job_status(4) == "failed", "job 4 failed")
     page = carol.get(Q + "/").text
-    assert "Printer error" in page and "Thermal Runaway" in page
+    assert "Printer error" in page and "Thermal Runaway" in page, page[page.find("Research"):][:1500]
+    requests.post(F2 + "/fake/blackout/0.8")
+    time.sleep(0.9)
+    assert "Thermal Runaway" in carol.get(Q + "/").text, "a short outage must not hide a printer error"
     clear(carol, "2")
     assert lock("2") == "NEEDS_CLEAR", "students cannot clear a printer that is in error"
     ok.append("printer error: job failed, error shown, students cannot unlock")
@@ -161,9 +189,10 @@ try:
     staff = requests.Session()
     staff.post(Q + "/admin", data={"password": "wrong"})
     assert "Event log" not in staff.get(Q + "/admin").text
+    assert staff.get(Q + "/", allow_redirects=False).status_code == 302, "wrong staff password = not signed in"
     staff.post(Q + "/admin", data={"password": "staffpw"})
     adm = staff.get(Q + "/admin").text
-    assert "Event log" in adm and "Plate marked clear by Tester" in adm
+    assert "Event log" in adm and "Plate marked clear by Carol (carol@kmutt.ac.th)" in adm
     staff.post(Q + "/admin/printer/1/pause_queue")
     submit(alice, "1", "Alice", gcode("alice4.gcode", 5))
     clear(carol, "1")
@@ -220,4 +249,8 @@ finally:
         p.terminate()
     for line in ok:
         print("PASS", line)
+    if sys.exc_info()[0]:
+        with open(os.path.join(data, "app.log")) as f:
+            print("--- app log (last 25 lines) ---")
+            print("".join(f.readlines()[-25:]))
     print("%d checks passed" % len(ok))
