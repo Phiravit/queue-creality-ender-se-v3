@@ -96,7 +96,7 @@
       {% for j, wait in d.queue %}
       <tr>
         <td class="num">{{ loop.index }}</td>
-        <td><b>{{ j.student_name }}</b>{% if is_admin() %} <span class="muted">({{ j.email or j.student_id }})</span>{% endif %}<br>
+        <td><b>{{ j.student_name }}</b>{% if is_admin() %} <span class="muted">({{ j.student_id }})</span>{% endif %}<br>
             <span class="muted">{{ j.filename }}{% if j.note %} · {{ j.note }}{% endif %}</span></td>
         <td class="num when">{% if row.lock == 'NEEDS_CLEAR' and loop.first %}After the plate is cleared{% else %}In about {{ fmt_dur(wait) }}{% endif %}<br>
             <span class="muted">{{ fmt_dur(j.est_seconds) }} print</span></td>

@@ -26,15 +26,15 @@ the button, so staff can check from anywhere.
 
 ## Sign-in
 
-Students sign in once per device with their name and a university email ending in
-`@mail.kmutt.ac.th`, `@ad.sit.kmutt.ac.th` or `@kmutt.ac.th` (set in
-`ALLOWED_EMAIL_DOMAINS`). They stay signed in for about four months. Jobs belong to
-the email, so a student can cancel their print from any device they're signed in on.
+The first time, a student signs in with their student ID and full name. After that
+the device remembers them for about four months, and on a new device the student ID
+alone is enough (the queue remembers the name). Jobs belong to the student ID, so a
+student can cancel their print from any device they're signed in on.
 
-The queue only checks the domain; it doesn't email a code. That's deliberate for a
-closed lab on the KMUTT network: it's light, and it records who printed what. Anyone
-who types someone else's email could act as them. Note that the KMUTT network isn't
-SIT-only, so for SIT students only, remove `kmutt.ac.th` from the list.
+There is no password: it's an honour system for a small closed lab, and it records
+who printed what. Anyone who types someone else's ID could act as them. The ID must
+be 6–15 digits; change `STUDENT_ID_PATTERN` in `config.env` (a regular expression)
+to accept only SIT IDs if you know their format.
 
 ## Jobs
 

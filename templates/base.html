@@ -103,9 +103,9 @@
 <header><div class="bar-in">
   <h1><a href="{{ url_for('index') }}">3D Print Queue</a></h1>
   <nav>
-    {% if user_email() %}<span title="{{ user_email() }}">{{ user_name() }}</span>{% endif %}
+    {% if user_sid() %}<span title="{{ user_sid() }}">{{ user_name() }}</span>{% endif %}
     {% if is_admin() %}<a href="{{ url_for('admin') }}">Staff page</a>{% else %}<a href="{{ url_for('admin') }}">Staff</a>{% endif %}
-    {% if user_email() or is_admin() %}<form class="inline" method="post" action="{{ url_for('logout') }}"><button class="small">Sign out</button></form>{% endif %}
+    {% if user_sid() or is_admin() %}<form class="inline" method="post" action="{{ url_for('logout') }}"><button class="small">Sign out</button></form>{% endif %}
   </nav>
 </div></header>
 <main>

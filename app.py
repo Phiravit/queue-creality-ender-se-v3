@@ -61,10 +61,8 @@ ALLOWED_EXT = (".gcode", ".gco", ".g")
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
 DISCORD_STAFF_ROLE = os.environ.get("DISCORD_STAFF_ROLE_ID", "")
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
-# Students sign in with an email on one of these domains (exact match after the @).
-ALLOWED_DOMAINS = [d.strip().lower().lstrip("@") for d in os.environ.get(
-    "ALLOWED_EMAIL_DOMAINS", "mail.kmutt.ac.th,ad.sit.kmutt.ac.th,kmutt.ac.th").split(",") if d.strip()]
-EMAIL_RE = re.compile(r"^[a-z0-9._%+-]+@([a-z0-9-]+(\.[a-z0-9-]+)+)$")
+# Students sign in with their student ID (and their full name the first time).
+STUDENT_ID_RE = re.compile(os.environ.get("STUDENT_ID_PATTERN", r"^[0-9]{6,15}$"))
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -226,10 +224,9 @@ def init_db():
             cleared_by TEXT, cleared_at REAL);
         CREATE TABLE IF NOT EXISTS events(
             id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, printer TEXT, msg TEXT);
+        CREATE TABLE IF NOT EXISTS students(
+            student_id TEXT PRIMARY KEY, name TEXT NOT NULL, first_seen REAL, last_seen REAL);
         """)
-        cols = [r["name"] for r in c.execute("PRAGMA table_info(jobs)")]
-        if "email" not in cols:
-            c.execute("ALTER TABLE jobs ADD COLUMN email TEXT")
         for pid in PRINTERS:
             c.execute("INSERT OR IGNORE INTO printers(id, lock, lock_reason) VALUES(?,?,?)",
                       (pid, "NEEDS_CLEAR", "Queue just started: check the plate is empty."))
@@ -449,26 +446,22 @@ def is_admin():
     return bool(session.get("admin"))
 
 
-def user_email():
-    return session.get("email")
+def user_sid():
+    return session.get("sid")
 
 
 def owns(job):
-    return bool(user_email()) and job["email"] == user_email()
+    return bool(user_sid()) and job["student_id"] == user_sid()
 
 
 def my_jobs():
     """Ids of this student's queued or printing jobs (on any device)."""
-    if not user_email():
+    if not user_sid():
         return set()
     with tx() as c:
         return {r["id"] for r in c.execute(
-            "SELECT id FROM jobs WHERE email=? AND status IN ('queued','printing')", (user_email(),))}
-
-
-def email_ok(email):
-    m = EMAIL_RE.match(email)
-    return bool(m) and m.group(1) in ALLOWED_DOMAINS
+            "SELECT id FROM jobs WHERE student_id=? AND status IN ('queued','printing')",
+            (user_sid(),))}
 
 
 def view_data():
@@ -514,15 +507,14 @@ def _secret():
 app.secret_key = _secret()
 app.permanent_session_lifetime = timedelta(days=120)   # stay signed in for a semester
 app.jinja_env.globals.update(fmt_dur=fmt_dur, fmt_time=fmt_time, is_admin=is_admin,
-                             user_email=user_email, user_name=lambda: session.get("name"),
-                             allowed_domains=ALLOWED_DOMAINS)
+                             user_sid=user_sid, user_name=lambda: session.get("name"))
 
 OPEN_ENDPOINTS = {"login", "admin", "logout", "static"}
 
 
 @app.before_request
 def require_login():
-    if request.endpoint in OPEN_ENDPOINTS or user_email() or is_admin():
+    if request.endpoint in OPEN_ENDPOINTS or user_sid() or is_admin():
         return None
     if request.endpoint == "partial":
         return "", 401          # the page script reloads and lands on the login page
@@ -532,19 +524,27 @@ def require_login():
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        email = request.form.get("email", "").strip().lower()[:120]
+        sid = "".join(request.form.get("sid", "").split())[:20]
         name = " ".join(request.form.get("name", "").split())[:60]
-        if not name:
-            flash("Enter your name.", "bad")
-        elif not email_ok(email):
-            flash("Use your KMUTT or SIT email (ending in %s)." %
-                  " or ".join("@" + d for d in ALLOWED_DOMAINS), "bad")
-        else:
-            session.permanent = True
-            session["email"], session["name"] = email, name
-            return redirect(url_for("index"))
-        return render_template("student_login.html", email=email, name=name)
-    return render_template("student_login.html", email="", name="")
+        with tx() as c:
+            known = c.execute("SELECT name FROM students WHERE student_id=?", (sid,)).fetchone() \
+                if STUDENT_ID_RE.match(sid) else None
+            if not STUDENT_ID_RE.match(sid):
+                flash("Enter your student ID (numbers only).", "bad")
+            elif not name and not known:
+                flash("First time here: also enter your full name.", "bad")
+            else:
+                name = name or known["name"]
+                now = time.time()
+                c.execute("INSERT INTO students(student_id, name, first_seen, last_seen) "
+                          "VALUES(?,?,?,?) ON CONFLICT(student_id) DO UPDATE SET "
+                          "name=excluded.name, last_seen=excluded.last_seen",
+                          (sid, name, now, now))
+                session.permanent = True
+                session["sid"], session["name"] = sid, name
+                return redirect(url_for("index"))
+        return render_template("student_login.html", sid=sid, name=name)
+    return render_template("student_login.html", sid="", name="")
 
 
 @app.errorhandler(413)
@@ -567,8 +567,7 @@ def partial():
 @app.post("/submit")
 def submit():
     pid = request.form.get("printer", "")
-    name, email = session.get("name") or "Staff", user_email() or "staff"
-    sid = email.split("@")[0][:20]
+    name, sid = session.get("name") or "Staff", user_sid() or "staff"
     note = request.form.get("note", "").strip()[:200]
     f = request.files.get("file")
     if pid not in PRINTERS:
@@ -583,13 +582,13 @@ def submit():
         f.save(path)
         est = estimate_seconds(path)
         with tx() as c:
-            cur = c.execute("INSERT INTO jobs(printer, student_name, student_id, email, note, "
+            cur = c.execute("INSERT INTO jobs(printer, student_name, student_id, note, "
                             "filename, stored, est_seconds, sort, created) "
-                            "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                            (pid, name, sid, email, note, f.filename[:120], stored, est,
+                            "VALUES(?,?,?,?,?,?,?,?,?)",
+                            (pid, name, sid, note, f.filename[:120], stored, est,
                              time.time(), time.time()))
             jid = cur.lastrowid
-            event(c, pid, "Job #%d queued by %s (%s): %s" % (jid, name, email, f.filename))
+            event(c, pid, "Job #%d queued by %s (%s): %s" % (jid, name, sid, f.filename))
         flash("Added to the queue for %s. Job #%d." % (PRINTERS[pid].name, jid), "ok")
     return redirect(url_for("index"))
 
@@ -644,7 +643,7 @@ def clear_plate(pid):
     if not is_admin() and request.form.get("confirm") != "yes":
         flash("Tick the box to confirm the plate is empty.", "bad")
         return redirect(request.referrer or url_for("index"))
-    who = "%s (%s)" % (session["name"], user_email()) if user_email() else "staff"
+    who = "%s (%s)" % (session["name"], user_sid()) if user_sid() else "staff"
     with tx() as c:
         row = c.execute("SELECT * FROM printers WHERE id=?", (pid,)).fetchone()
         if row["lock"] != "NEEDS_CLEAR":

@@ -59,9 +59,9 @@ def submit(s, printer, name, path):
     return r
 
 
-def login(name, email):
+def login(sid, name=""):
     s = requests.Session()
-    s.post(Q + "/login", data={"name": name, "email": email})
+    s.post(Q + "/login", data={"sid": sid, "name": name})
     return s
 
 
@@ -91,24 +91,24 @@ def _up():
 ok = []
 try:
     wait_until(_up, "queue web server")
-    # 0. Sign-in: KMUTT/SIT domains only, everything else needs sign-in first.
+    # 0. Sign-in: student ID (+ full name the first time); pages locked otherwise.
     anon = requests.Session()
     r = anon.get(Q + "/", allow_redirects=False)
     assert r.status_code == 302 and "/login" in r.headers["Location"]
     assert anon.get(Q + "/partial").status_code == 401
     assert anon.post(Q + "/submit", data={"printer": "1"}, allow_redirects=False).status_code == 302
-    for bad in ("x@gmail.com", "x@mail.kmutt.ac.th.evil.com", "x@sub.mail.kmutt.ac.th",
-                "x@kmutt.ac.th@gmail.com", "not-an-email", "x@evilkmutt.ac.th"):
-        r = anon.post(Q + "/login", data={"name": "X", "email": bad})
-        assert "Use your KMUTT or SIT email" in r.text, bad
+    for bad in ("", "abc", "12 ab", "1234", "x@kmutt.ac.th"):
+        r = anon.post(Q + "/login", data={"sid": bad, "name": "X"})
+        assert "Enter your student ID" in r.text, bad
         assert anon.get(Q + "/", allow_redirects=False).status_code == 302, bad
-    assert "Enter your name." in anon.post(Q + "/login", data={"name": "  ", "email": "a@kmutt.ac.th"}).text
+    r = anon.post(Q + "/login", data={"sid": "65130500001", "name": "  "})
+    assert "First time here" in r.text
     assert anon.get(Q + "/", allow_redirects=False).status_code == 302
-    alice = login("Alice", "Alice.W@MAIL.KMUTT.AC.TH")
-    bob = login("Bob", "65130500001@ad.sit.kmutt.ac.th")
-    carol = login("Carol", "carol@kmutt.ac.th")
-    assert "alice.w@mail.kmutt.ac.th" in alice.get(Q + "/").text, "email stored lower-case"
-    ok.append("sign-in: only @mail.kmutt.ac.th / @ad.sit.kmutt.ac.th / @kmutt.ac.th; pages locked otherwise")
+    alice = login("65130500001", "Alice  Wong")
+    bob = login("65130500002", "Bob")
+    carol = login("65130500003", "Carol")
+    assert "Alice Wong" in alice.get(Q + "/").text and "65130500001" in alice.get(Q + "/").text
+    ok.append("sign-in: student ID + name first time; bad IDs refused; pages locked otherwise")
 
     # 1. Fresh start is locked: a job must not start before someone clears the plate.
     submit(alice, "1", "Alice", gcode("alice.gcode", 90))
@@ -126,8 +126,9 @@ try:
     assert "30m" in page, "slicer estimate"
     assert "Cancel print" in page, "owner cancel"
     assert "Cancel print" not in carol.get(Q + "/").text, "other students must not see cancel"
-    alice_phone = login("Alice", "alice.w@mail.kmutt.ac.th")
-    assert "Cancel print" in alice_phone.get(Q + "/").text, "same email on another device owns the job"
+    alice_phone = login(" 6513 0500001 ")      # returning student: ID only, name remembered
+    assert "Alice Wong" in alice_phone.get(Q + "/").text, "name remembered from first sign-in"
+    assert "Cancel print" in alice_phone.get(Q + "/").text, "same student ID on another device owns the job"
     ok.append("plate clear -> next job auto-starts; slicer time shown; only owner sees cancel")
 
     # 3. When the print finishes, the printer locks again and job 2 waits.
@@ -192,7 +193,7 @@ try:
     assert staff.get(Q + "/", allow_redirects=False).status_code == 302, "wrong staff password = not signed in"
     staff.post(Q + "/admin", data={"password": "staffpw"})
     adm = staff.get(Q + "/admin").text
-    assert "Event log" in adm and "Plate marked clear by Carol (carol@kmutt.ac.th)" in adm
+    assert "Event log" in adm and "Plate marked clear by Carol (65130500003)" in adm
     staff.post(Q + "/admin/printer/1/pause_queue")
     submit(alice, "1", "Alice", gcode("alice4.gcode", 5))
     clear(carol, "1")
@@ -230,7 +231,7 @@ try:
     # 12. Discord alerts went out, staff role pinged only on problems.
     msgs = requests.get(F1 + "/fake/messages").json()
     texts = [m["content"] for m in msgs]
-    done = [t for t in texts if "Alice's alice.gcode is done" in t]
+    done = [t for t in texts if "Alice Wong's alice.gcode is done" in t]
     assert done and "Plate is clear" in done[0] and "http://queue.test" in done[0], texts
     failed = [m for m in msgs if "FAILED" in m["content"]]
     assert failed and failed[0]["content"].startswith("<@&999>") and failed[0]["allowed_mentions"]["roles"] == ["999"]
