@@ -102,7 +102,7 @@ That's deliberate.
 
 ## First run on the real printers
 
-Everything so far was tested against a fake OctoPrint. Before letting students use it:
+Before letting students use it:
 
 1. With the queue running, open the page while **nothing** is queued. Both printers should
    show their real state and temperatures (this only reads from OctoPrint).
@@ -144,16 +144,6 @@ Students who still have the shared OctoPrint logins can skip the
 queue. The queue notices those prints and locks afterwards, but for a fair queue,
 change those passwords so only staff use OctoPrint directly.
 
-## Testing without the real printers
-
-`dev/fake_octoprint.py` pretends to be OctoPrint, and `dev/e2e_test.py` runs the
-whole flow against two fakes (14 checks, no real printer touched):
-
-```bash
-pip install -r requirements.txt
-python dev/e2e_test.py
-```
-
 ## Files
 
 | File | What it is |
@@ -164,4 +154,3 @@ python dev/e2e_test.py
 | `print-queue.service` | systemd unit to start on boot |
 | `install.sh` | Installer/updater to run on the Pi |
 | `data/` | Created at runtime: SQLite database and uploaded files |
-| `dev/` | Fake OctoPrint and the end-to-end test |
