@@ -144,9 +144,20 @@ MESSAGES = []
 
 @app.post("/fake/webhook")
 def webhook():
-    """Stands in for a Discord webhook."""
-    MESSAGES.append(request.get_json())
-    return "", 204
+    """Stands in for a Discord webhook (?wait=true returns the message, like Discord)."""
+    msg = dict(request.get_json(), id=str(1000 + len(MESSAGES)))
+    MESSAGES.append(msg)
+    return (jsonify(msg), 200) if request.args.get("wait") == "true" else ("", 204)
+
+
+@app.patch("/fake/webhook/messages/<mid>")
+def webhook_edit(mid):
+    for m in MESSAGES:
+        if m["id"] == mid:
+            m.update(request.get_json())
+            m["edits"] = m.get("edits", 0) + 1
+            return jsonify(m)
+    return "", 404
 
 
 @app.get("/fake/messages")

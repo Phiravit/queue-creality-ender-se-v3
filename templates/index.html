@@ -1,23 +1,28 @@
 {% extends "base.html" %}
 {% block body %}
-<div id="printers">{% include "_printers.html" %}</div>
+<div data-live="{{ url_for('partial', p=pid, part='tabs') }}">{% include "_tabs.html" %}</div>
+<a class="btn jump" href="#add"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>Add a print to this printer</a>
+<div class="tabpage">
+  <div id="printers" data-live="{{ url_for('partial', p=pid) }}">{% with printers = shown %}{% include "_printers.html" %}{% endwith %}</div>
 
-<section class="card" style="margin-top:16px; max-width:560px" aria-labelledby="add-h">
-  <h2 id="add-h">Add a print to the queue</h2>
-  {% if user_sid() %}<p class="muted" style="margin:0">Submitting as {{ user_name() }} · {{ user_sid() }}</p>{% endif %}
-  <form method="post" action="{{ url_for('submit') }}" enctype="multipart/form-data">
-    <label for="f-printer">Printer</label>
-    <select id="f-printer" name="printer" required>
-      {% for d in printers %}<option value="{{ d.p.id }}">{{ d.p.name }}</option>{% endfor %}
-    </select>
-    <label for="f-file">G-code file <span class="hint">(sliced for this printer, up to {{ max_mb }} MB)</span></label>
-    <input type="file" id="f-file" name="file" accept=".gcode,.gco,.g" required>
-    <label for="f-note">Note <span class="hint">(optional, e.g. filament colour)</span></label>
-    <input type="text" id="f-note" name="note" maxlength="200">
-    <div style="margin-top:14px"><button class="primary" data-busy="Uploading…" data-label="Add to queue">Add to queue</button></div>
-  </form>
-  <p class="muted">When your print is done, take it off the plate, then press
-    <b>Plate is clear</b> on this page so the next person's print can start.
-    You can remove or cancel your own jobs from any device you're signed in on.</p>
-</section>
+  <section class="card addcard" id="add" aria-labelledby="add-h">
+    <h2 id="add-h" style="margin-bottom:4px">Add a print to {{ p.name }}</h2>
+    {% if user_sid() %}<p class="muted" style="margin:0">Submitting as {{ user_name() }} · <span class="num">{{ user_sid() }}</span></p>{% endif %}
+    <form method="post" action="{{ url_for('submit') }}" enctype="multipart/form-data">
+      <input type="hidden" name="printer" value="{{ pid }}">
+      {% if not printer_unlocked(p) %}
+        <label for="f-pw">Printer password <span class="hint">(from lab staff; you only type it once)</span></label>
+        <input type="password" id="f-pw" name="printer_password" autocomplete="off" maxlength="100" required>
+      {% endif %}
+      <label for="f-file">G-code file <span class="hint">(sliced for this printer, up to {{ max_mb }} MB)</span></label>
+      <input type="file" id="f-file" name="file" accept=".gcode,.gco,.g" required>
+      <label for="f-note">Note <span class="hint">(optional, e.g. filament colour)</span></label>
+      <input type="text" id="f-note" name="note" maxlength="200">
+      <div style="margin-top:14px"><button class="primary block" data-busy="Uploading…" data-label="Add to queue">Add to queue</button></div>
+    </form>
+    <p class="muted">When your print is done, take it off the plate, then press
+      <b>Plate is clear</b> so the next person's print can start.
+      You can remove or cancel your own jobs from any device you're signed in on.</p>
+  </section>
+</div>
 {% endblock %}

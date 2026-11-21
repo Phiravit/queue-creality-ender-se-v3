@@ -12,6 +12,8 @@ Each printer has a lock:
 OctoPrint has no sensor for "something is on the bed", so the queue fails
 locked: whenever it is unsure, it waits for a human.
 """
+import hashlib
+import hmac
 import os
 import re
 import sqlite3
@@ -21,7 +23,7 @@ import time
 import uuid
 import logging
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 from flask import (Flask, Response, abort, flash, redirect, render_template,
@@ -58,32 +60,56 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 START_GRACE = float(os.environ.get("START_GRACE_SECONDS", "30"))
 BAD_POLLS_BEFORE_LOCK = int(os.environ.get("BAD_POLLS_BEFORE_LOCK", "3"))
 ALLOWED_EXT = (".gcode", ".gco", ".g")
-DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
-DISCORD_STAFF_ROLE = os.environ.get("DISCORD_STAFF_ROLE_ID", "")
+# Discord servers to alert: DISCORD1_WEBHOOK_URL, DISCORD2_..., each with its own optional
+# staff role (roles belong to one server). DISCORD_WEBHOOK_URL alone still works too.
+HOOKS = []
+for _n in [""] + [str(i) for i in range(1, 10)]:
+    _url = os.environ.get("DISCORD%s_WEBHOOK_URL" % _n, "").strip().strip("()<>\"' ")
+    if _url and _url not in [h["url"] for h in HOOKS]:
+        HOOKS.append({"url": _url, "role": os.environ.get("DISCORD%s_STAFF_ROLE_ID" % _n, "").strip(),
+                      # DISCORDn_PRINTERS=2 -> only printer 2's alerts and board (empty = all)
+                      "printers": [x.strip() for x in os.environ.get("DISCORD%s_PRINTERS" % _n, "")
+                                   .split(",") if x.strip()],
+                      "key": hashlib.sha256(_url.encode()).hexdigest()[:12]})
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
+# One Discord message showing every printer's status and queue, edited in place.
+DISCORD_BOARD = os.environ.get("DISCORD_STATUS_BOARD", "1").strip().lower() not in ("0", "no", "off", "false")
+BOARD_MIN_EDIT = float(os.environ.get("DISCORD_BOARD_SECONDS", "20"))   # at most one edit per this
+# Clock times (finish estimates, history) are shown in this time zone. Thailand = +7 (no DST).
+TZ_HOURS = float(os.environ.get("TIMEZONE_OFFSET_HOURS", "7"))
+LOCAL_TZ = timezone(timedelta(hours=TZ_HOURS))
+TZ_LABEL = "GMT%+g" % TZ_HOURS
 # Students sign in with their student ID (and their full name the first time).
 STUDENT_ID_RE = re.compile(os.environ.get("STUDENT_ID_PATTERN", r"^[0-9]{6,15}$"))
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
-def notify(text, staff=False):
-    """Post to the Discord channel webhook in the background. Never raises."""
-    if not DISCORD_WEBHOOK:
-        return
+def notify(pid, text, staff=False):
+    """Post to every Discord webhook that follows this printer, in the background. Never raises."""
     if PUBLIC_URL:
-        text += "\n" + PUBLIC_URL
-    payload = {"content": text[:1900], "allowed_mentions": {"parse": []}}
-    if staff and DISCORD_STAFF_ROLE:
-        payload["content"] = "<@&%s> %s" % (DISCORD_STAFF_ROLE, payload["content"])
-        payload["allowed_mentions"]["roles"] = [DISCORD_STAFF_ROLE]
+        text += "\n" + PUBLIC_URL + "/?p=" + pid
+    for hook in HOOKS:
+        if hook["printers"] and pid not in hook["printers"]:
+            continue
+        payload = {"content": text[:1900], "allowed_mentions": {"parse": []}}
+        if staff and hook["role"]:
+            payload["content"] = "<@&%s> %s" % (hook["role"], payload["content"])
+            payload["allowed_mentions"]["roles"] = [hook["role"]]
 
-    def send():
-        try:
-            requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
-        except requests.RequestException:
-            log.warning("Discord webhook failed")
-    threading.Thread(target=send, daemon=True).start()
+        def send(url=hook["url"], payload=payload):
+            try:
+                requests.post(url, json=payload, timeout=10).raise_for_status()
+            except requests.RequestException as e:
+                log.warning("Discord webhook failed: %s", getattr(e.response, "status_code", e))
+        threading.Thread(target=send, daemon=True).start()
+
+
+def _webhook_url(hook_url, path="", **query):
+    """A webhook URL with an extra path (e.g. /messages/<id>) and query, keeping any ?thread_id."""
+    base, _, q = hook_url.partition("?")
+    parts = [x for x in [q] + ["%s=%s" % kv for kv in query.items()] if x]
+    return base.rstrip("/") + path + ("?" + "&".join(parts) if parts else "")
 
 
 class Printer:
@@ -183,6 +209,8 @@ for i in range(1, 10):
         PRINTERS[pid] = Printer(pid, os.environ.get("PRINTER%d_NAME" % i, "Printer %d" % i), url,
                                 os.environ.get("PRINTER%d_APIKEY" % i, ""),
                                 os.environ.get("PRINTER%d_SNAPSHOT" % i, ""))
+        # Optional: students need this password to queue on the printer (staff don't).
+        PRINTERS[pid].password = os.environ.get("PRINTER%d_PASSWORD" % i, "")
 
 # Latest OctoPrint reading per printer, filled by the poller thread.
 LIVE = {pid:{"kind": "unreachable", "text": "Starting...", "error": ""} for pid in PRINTERS}
@@ -226,6 +254,10 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, printer TEXT, msg TEXT);
         CREATE TABLE IF NOT EXISTS students(
             student_id TEXT PRIMARY KEY, name TEXT NOT NULL, first_seen REAL, last_seen REAL);
+        CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS unlocks(            -- who already typed a printer's password
+            student_id TEXT NOT NULL, printer TEXT NOT NULL, token TEXT NOT NULL,
+            PRIMARY KEY(student_id, printer));
         """)
         for pid in PRINTERS:
             c.execute("INSERT OR IGNORE INTO printers(id, lock, lock_reason) VALUES(?,?,?)",
@@ -301,7 +333,7 @@ def poll_printer(p):
                 # may well still be fine, so keep the job; just stop new starts.
                 if lock == "READY":
                     event(c, p.id, "Locked: " + why)
-                    notify("⚠️ **%s**: the queue can't reach OctoPrint (%s)." % (p.name, why),
+                    notify(p.id, "⚠️ **%s**: the queue can't reach OctoPrint (%s)." % (p.name, why),
                            staff=True)
                     set_lock(c, p.id, "NEEDS_CLEAR",
                              "The queue lost contact with this printer. Check the plate.")
@@ -311,13 +343,13 @@ def poll_printer(p):
             if lock == "BUSY":
                 job = finish_current(c, p, row, "failed", "Printer stopped: " + why)
                 event(c, p.id, "Print failed: " + why)
-                notify("❌ **%s**: %s FAILED: %s. Staff please check the printer, "
+                notify(p.id, "❌ **%s**: %s FAILED: %s. Staff please check the printer, "
                        "then clear the plate." % (p.name, who(job), why), staff=True)
                 set_lock(c, p.id, "NEEDS_CLEAR",
                          "Printer had a problem during a print (%s). Fix it, then clear the plate." % why)
             elif lock == "READY":
                 event(c, p.id, "Locked: " + why)
-                notify("⚠️ **%s** is locked: %s" % (p.name, why), staff=True)
+                notify(p.id, "⚠️ **%s** is locked: %s" % (p.name, why), staff=True)
                 set_lock(c, p.id, "NEEDS_CLEAR",
                          "Printer was offline or in error (%s). Check the plate." % why)
             return
@@ -331,7 +363,7 @@ def poll_printer(p):
                          "Printing a file that was not sent by the queue" if outside else "Printing",
                          busy_since=time.time())
                 if outside:
-                    notify("ℹ️ **%s**: someone started `%s` directly in OctoPrint, "
+                    notify(p.id, "ℹ️ **%s**: someone started `%s` directly in OctoPrint, "
                            "not through the queue." % (p.name, st["file"]))
             elif row["lock_reason"] == "Sending file to printer":
                 c.execute("UPDATE printers SET lock_reason='Printing' WHERE id=?", (p.id,))
@@ -349,14 +381,15 @@ def poll_printer(p):
             if completion >= 99.5:
                 job = finish_current(c, p, row, "done", "Finished")
                 event(c, p.id, "Print finished")
-                notify("✅ **%s**: %s is done. Please take it off the plate and press "
-                       "**Plate is clear** so the next print can start." % (p.name, who(job)))
+                notify(p.id, "✅ **%s**: %s is done. Please take it off the plate and press "
+                       "**Plate is clear** so the next print can start.\n%s"
+                       % (p.name, who(job), next_up(c, p.id)))
                 set_lock(c, p.id, "NEEDS_CLEAR", "Print finished. Take it off the plate.")
             else:
                 job = finish_current(c, p, row, "stopped", "Stopped at %.0f%%" % completion)
                 event(c, p.id, "Print stopped at %.0f%%" % completion)
-                notify("⏹️ **%s**: %s was stopped at %.0f%%. Clear the plate, then press "
-                       "**Plate is clear**." % (p.name, who(job), completion))
+                notify(p.id, "⏹️ **%s**: %s was stopped at %.0f%%. Clear the plate, then press "
+                       "**Plate is clear**.\n%s" % (p.name, who(job), completion, next_up(c, p.id)))
                 set_lock(c, p.id, "NEEDS_CLEAR",
                          "Print was stopped at %.0f%%. Remove what is left on the plate." % completion)
             return
@@ -379,7 +412,10 @@ def launch(p, job):
         c.execute("UPDATE jobs SET status='printing', started=?, octo_name=? WHERE id=?",
                   (time.time(), octo_name, job["id"]))
         event(c, p.id, "Starting job #%d (%s, %s)" % (job["id"], job["filename"], job["student_name"]))
-    notify("▶️ **%s**: started %s (about %s)." % (p.name, who(job), fmt_dur(job["est_seconds"])))
+    notify(p.id, "▶️ **%s**: started %s (about %s%s)." % (
+        p.name, who(job), fmt_dur(job["est_seconds"]),
+        ", done around %s %s" % (fmt_clock(time.time() + job["est_seconds"]), TZ_LABEL)
+        if job["est_seconds"] else ""))
     try:
         p.upload_and_print(os.path.join(UPLOAD_DIR, job["stored"]), octo_name)
     except Exception as e:   # noqa: BLE001 - any failure must lock the printer
@@ -390,8 +426,17 @@ def launch(p, job):
             set_lock(c, p.id, "NEEDS_CLEAR",
                      "Could not start job #%d (%s). Job kept in the queue." % (job["id"], e))
             event(c, p.id, "Start failed for job #%d: %s" % (job["id"], e))
-        notify("❌ **%s**: could not start %s (%s). It stays in the queue." % (p.name, who(job), e),
+        notify(p.id, "❌ **%s**: could not start %s (%s). It stays in the queue." % (p.name, who(job), e),
                staff=True)
+
+
+def next_up(c, pid):
+    j = c.execute("SELECT * FROM jobs WHERE printer=? AND status='queued' ORDER BY sort, id LIMIT 1",
+                  (pid,)).fetchone()
+    if not j:
+        return "Nobody is waiting for this printer."
+    n = c.execute("SELECT COUNT(*) FROM jobs WHERE printer=? AND status='queued'", (pid,)).fetchone()[0]
+    return "Next up: %s%s." % (who(j), " (+%d more waiting)" % (n - 1) if n > 1 else "")
 
 
 def poller():
@@ -402,6 +447,99 @@ def poller():
             except Exception:   # noqa: BLE001 - keep polling the other printer
                 log.exception("poll failed for printer %s", p.id)
         time.sleep(POLL_SECONDS)
+
+
+# ---------------------------------------------------------------- Discord status board
+
+BOARD_COLOURS = {"ok": 0x1F9D4D, "busy": 0x2B63C6, "warn": 0xD9750F, "bad": 0xD93A2B, "idle": 0x8A909C}
+BOARD_ICONS = {"ok": "🟢", "busy": "🔵", "warn": "🟠", "bad": "🔴", "idle": "⚪"}
+
+
+def board_payload():
+    """The status message: one embed per printer with its state and queue."""
+    embeds = []
+    for d in view_data():
+        p, row, live, cur = d["p"], d["row"], d["live"], d["cur"]
+        colour, text = d["summary"]
+        free_text, free_ts = d["free"]
+        lines = ["%s **%s**" % (BOARD_ICONS[colour], text),
+                 "🕒 %s%s" % (free_text, " (%s)" % TZ_LABEL if free_ts else "")]
+        if row["lock"] == "BUSY":
+            lines.append("%s · `%s`" % (cur["student_name"] if cur else "Not from the queue",
+                                        cur["filename"] if cur else live.get("file") or "?"))
+            lines.append(finish_line(d["cur_done"]))
+        elif row["lock"] == "NEEDS_CLEAR" or colour == "bad":
+            lines.append(live.get("error") or live.get("text") if colour == "bad" else row["lock_reason"])
+        q = d["queue"]
+        qtext = "\n".join("%d. %s · `%s` (%s)" % (i + 1, j["student_name"], j["filename"],
+                                                  fmt_dur(j["est_seconds"]) + (
+                                                      ", done ~%s" % fmt_clock(done) if done else ""))
+                          for i, (j, _w, done) in enumerate(q[:10])) or "Nobody is waiting."
+        if len(q) > 10:
+            qtext += "\n…and %d more" % (len(q) - 10)
+        e = {"title": p.name[:250], "color": BOARD_COLOURS[colour],
+             "description": "\n".join(x for x in lines if x)[:2000],
+             "fields": [{"name": "Queue (%d)" % len(q), "value": qtext[:1000]}]}
+        if PUBLIC_URL:
+            e["url"] = PUBLIC_URL + "/?p=" + p.id
+        embeds.append(e)
+    return {"content": "**3D printer status** · this message updates by itself",
+            "embeds": embeds, "allowed_mentions": {"parse": []}}
+
+
+def _meta(key, value=None):
+    with tx() as c:
+        if value is None:
+            r = c.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+            return r["value"] if r else None
+        c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?,?)", (key, value))
+
+
+def board_send(hook, payload):
+    """Edit this server's status message, or post a new one if it was never sent or got deleted."""
+    key = "board_msg:" + hook["key"]
+    mid = _meta(key)
+    if mid:
+        r = requests.patch(_webhook_url(hook["url"], "/messages/" + mid), json=payload, timeout=10)
+        if r.status_code != 404:
+            r.raise_for_status()
+            return
+    r = requests.post(_webhook_url(hook["url"], wait="true"), json=payload, timeout=10)
+    r.raise_for_status()
+    _meta(key, str(r.json()["id"]))
+
+
+def board_loop():
+    """Keep one status message per Discord server up to date. One server failing
+    (deleted webhook, rate limit) never holds up the others or the queue."""
+    state = {h["key"]: {"sig": None, "sent": 0.0} for h in HOOKS}
+    while True:
+        time.sleep(max(POLL_SECONDS, 1))
+        try:
+            payload = board_payload()
+        except Exception:   # noqa: BLE001
+            log.warning("could not build the Discord status board", exc_info=True)
+            continue
+        now = time.time()
+        for hook in HOOKS:
+            # this server's printers only (embeds come in PRINTERS order)
+            embeds = [dict(e) for pid, e in zip(PRINTERS, payload["embeds"])
+                      if not hook["printers"] or pid in hook["printers"]]
+            if not embeds:
+                continue
+            s, sig = state[hook["key"]], repr(embeds)
+            if not ((sig != s["sig"] and now - s["sent"] >= BOARD_MIN_EDIT) or now - s["sent"] >= 300):
+                continue
+            p = dict(payload, embeds=embeds)
+            p["embeds"][-1]["timestamp"] = datetime.fromtimestamp(now, timezone.utc).isoformat()
+            p["embeds"][-1]["footer"] = {"text": "Last updated"}
+            try:
+                board_send(hook, p)
+                s["sig"] = sig
+            except Exception as e:   # noqa: BLE001 - Discord trouble must never stop the queue
+                log.warning("Discord status board update failed: %s", getattr(getattr(e, "response", None),
+                                                                              "status_code", e))
+            s["sent"] = now      # also backs off after a failure
 
 
 # ---------------------------------------------------------------- helpers
@@ -439,7 +577,29 @@ def fmt_dur(sec):
 
 
 def fmt_time(ts):
-    return datetime.fromtimestamp(ts).strftime("%d %b %H:%M") if ts else "-"
+    return datetime.fromtimestamp(ts, LOCAL_TZ).strftime("%d %b %H:%M") if ts else "-"
+
+
+def finish_line(done_ts):
+    """'Another 10m · estimated finish 13:46 (GMT+7)' for a running print."""
+    if not done_ts:
+        return "Estimated finish: working it out…"
+    return "Another %s · estimated finish %s (%s)" % (
+        fmt_dur(max(0, done_ts - time.time())), fmt_clock(done_ts, 60), TZ_LABEL)
+
+
+def fmt_clock(ts, step=300):
+    """Clock time for an estimate, rounded to `step` seconds (5 min by default):
+    '15:40', 'tomorrow 09:05'."""
+    if not ts:
+        return "-"
+    dt = datetime.fromtimestamp(round(ts / step) * step, LOCAL_TZ)
+    days = (dt.date() - datetime.now(LOCAL_TZ).date()).days
+    if days == 0:
+        return dt.strftime("%H:%M")
+    if days == 1:
+        return dt.strftime("tomorrow %H:%M")
+    return dt.strftime("%a %d %b %H:%M")
 
 
 def is_admin():
@@ -464,10 +624,84 @@ def my_jobs():
             (user_sid(),))}
 
 
-def view_data():
+def _pw_token(p):
+    return hmac.new(app.secret_key.encode(), ("%s:%s" % (p.id, p.password)).encode(),
+                    hashlib.sha256).hexdigest()[:24]
+
+
+def printer_unlocked(p):
+    """No password, staff, or this student already typed the current password (any device).
+    Changing the password changes the token, so everyone is asked again."""
+    if not p.password or is_admin():
+        return True
+    if not user_sid():
+        return False
+    with tx() as c:
+        r = c.execute("SELECT token FROM unlocks WHERE student_id=? AND printer=?",
+                      (user_sid(), p.id)).fetchone()
+    return bool(r) and hmac.compare_digest(r["token"], _pw_token(p))
+
+
+def remember_unlock(p):
+    if p.password and user_sid():
+        with tx() as c:
+            c.execute("INSERT OR REPLACE INTO unlocks(student_id, printer, token) VALUES(?,?,?)",
+                      (user_sid(), p.id, _pw_token(p)))
+
+
+def free_info(row, live, cur_done, rows):
+    """When the printer is expected to be free: (short text, clock time or None)."""
+    if live.get("kind") in ("error", "offline"):
+        return "Out of service until staff fix it", None
+    if row["queue_paused"] and rows:
+        return "Queue paused by staff", None
+    if rows:
+        last = rows[-1][2]
+        if last and all(r[2] for r in rows):
+            return "Free by ~%s" % fmt_clock(last), last
+        return "Free time unknown (a file has no time estimate)", None
+    if row["lock"] == "BUSY":
+        return ("Free by ~%s" % fmt_clock(cur_done), cur_done) if cur_done else ("Free after this print", None)
+    if row["lock"] == "NEEDS_CLEAR":
+        return "Free once the plate is cleared", None
+    if live.get("kind") == "unreachable":
+        return "Free time unknown (can't reach the printer)", None
+    return "Free now", None
+
+
+def summary(row, live):
+    """Short status for a printer tab: (colour, text)."""
+    if live.get("kind") == "error":
+        return "bad", "Error"
+    if live.get("kind") == "offline":
+        return "bad", "Offline"
+    if live.get("kind") == "unreachable":
+        return "bad", "Can't reach"
+    if row["lock"] == "BUSY":
+        return "busy", ("Paused" if live.get("paused") else
+                        "Printing %.0f%%" % (live.get("completion") or 0))
+    if row["lock"] == "NEEDS_CLEAR":
+        return "warn", "Clear the plate"
+    if row["queue_paused"]:
+        return "idle", "Queue paused"
+    return "ok", "Ready"
+
+
+def selected_printer():
+    """The printer tab to show: ?p= in the URL, else the last one picked, else the first."""
+    pid = request.args.get("p") or session.get("printer")
+    if pid not in PRINTERS:
+        pid = next(iter(PRINTERS))
+    session["printer"] = pid
+    return pid
+
+
+def view_data(only=None):
     out = []
     with tx() as c:
         for pid, p in PRINTERS.items():
+            if only and pid != only:
+                continue
             row = dict(c.execute("SELECT * FROM printers WHERE id=?", (pid,)).fetchone())
             cur = c.execute("SELECT * FROM jobs WHERE id=?", (row["current_job"],)).fetchone() \
                 if row["current_job"] else None
@@ -477,13 +711,27 @@ def view_data():
                                "('done','stopped','failed') ORDER BY finished DESC LIMIT 5",
                                (pid,)).fetchall()
             # rough wait: what is left of the current print + queued estimates
-            wait = LIVE[pid].get("time_left") or 0
-            waits = []
+            now, live = time.time(), LIVE[pid]
+            left = live.get("time_left")
+            if row["lock"] == "BUSY" and not left:
+                # OctoPrint gave no estimate: use the speed so far, else the slicer's estimate
+                done_pct, spent = live.get("completion") or 0, live.get("print_time") or 0
+                if done_pct >= 2 and spent:
+                    left = spent * (100 - done_pct) / done_pct
+                elif cur and cur["est_seconds"] and cur["started"]:
+                    left = max(60, cur["started"] + cur["est_seconds"] - now)
+            left = left if row["lock"] == "BUSY" else None
+            wait = left or 0
+            # each queued job: (job, seconds until it starts, estimated finish time or None)
+            rows = []
             for j in queue:
-                waits.append(wait)
+                rows.append((j, wait, now + wait + j["est_seconds"] if j["est_seconds"] else None))
                 wait += (j["est_seconds"] or 0) + 300   # +5 min to swap prints
-            out.append({"p": p, "row": row, "live": LIVE[pid], "cur": cur,
-                        "queue": list(zip(queue, waits)), "recent": recent})
+            cur_done = now + left if left else None
+            out.append({"p": p, "row": row, "live": live, "cur": cur,
+                        "queue": rows, "recent": recent, "cur_done": cur_done,
+                        "free": free_info(row, live, cur_done, rows),
+                        "summary": summary(row, live)})
     return out
 
 
@@ -506,8 +754,14 @@ def _secret():
 
 app.secret_key = _secret()
 app.permanent_session_lifetime = timedelta(days=120)   # stay signed in for a semester
-app.jinja_env.globals.update(fmt_dur=fmt_dur, fmt_time=fmt_time, is_admin=is_admin,
-                             user_sid=user_sid, user_name=lambda: session.get("name"))
+app.jinja_env.globals.update(fmt_dur=fmt_dur, fmt_time=fmt_time, fmt_clock=fmt_clock, finish_line=finish_line, tz_label=TZ_LABEL, is_admin=is_admin,
+                             user_sid=user_sid, user_name=lambda: session.get("name"),
+                             printer_unlocked=printer_unlocked)
+
+@app.context_processor
+def _now():
+    return {"now": time.time()}
+
 
 OPEN_ENDPOINTS = {"login", "admin", "logout", "static"}
 
@@ -555,13 +809,22 @@ def too_big(_e):
 
 @app.get("/")
 def index():
-    return render_template("index.html", printers=view_data(), mine=my_jobs(),
-                           max_mb=MAX_UPLOAD_MB)
+    pid = selected_printer()
+    printers = view_data()
+    return render_template("index.html", printers=printers, pid=pid, p=PRINTERS[pid],
+                           shown=[d for d in printers if d["p"].id == pid],
+                           mine=my_jobs(), max_mb=MAX_UPLOAD_MB)
 
 
 @app.get("/partial")
 def partial():
-    return render_template("_printers.html", printers=view_data(), mine=my_jobs())
+    """Live parts of the page: ?part=tabs the tab bar, ?p= one printer's card,
+    neither: every printer (staff page)."""
+    pid = request.args.get("p")
+    if request.args.get("part") == "tabs" and pid in PRINTERS:
+        return render_template("_tabs.html", printers=view_data(), pid=pid)
+    return render_template("_printers.html", mine=my_jobs(),
+                           printers=view_data(pid if pid in PRINTERS else None))
 
 
 @app.post("/submit")
@@ -576,7 +839,11 @@ def submit():
         flash("Choose a G-code file.", "bad")
     elif not f.filename.lower().endswith(ALLOWED_EXT):
         flash("Only sliced G-code files (.gcode) can be printed. Slice your STL first.", "bad")
+    elif not printer_unlocked(PRINTERS[pid]) and not hmac.compare_digest(
+            request.form.get("printer_password", "").encode(), PRINTERS[pid].password.encode()):
+        flash("Wrong password for %s. Ask lab staff for it." % PRINTERS[pid].name, "bad")
     else:
+        remember_unlock(PRINTERS[pid])      # never ask this student again (until it changes)
         stored = uuid.uuid4().hex + ".gcode"
         path = os.path.join(UPLOAD_DIR, stored)
         f.save(path)
@@ -589,8 +856,15 @@ def submit():
                              time.time(), time.time()))
             jid = cur.lastrowid
             event(c, pid, "Job #%d queued by %s (%s): %s" % (jid, name, sid, f.filename))
+            ahead = c.execute("SELECT COUNT(*) FROM jobs WHERE printer=? AND status IN "
+                              "('queued','printing') AND id<>?", (pid, jid)).fetchone()[0]
+        done = next((x[2] for d in view_data(pid) for x in d["queue"] if x[0]["id"] == jid), None)
+        notify(pid, "📥 **%s**: %s joined the queue (%s, about %s%s)." % (
+            PRINTERS[pid].name, "%s's `%s`" % (name, f.filename[:120]),
+            "%d ahead" % ahead if ahead else "first in line", fmt_dur(est),
+            ", done around %s %s" % (fmt_clock(done), TZ_LABEL) if done else ""))
         flash("Added to the queue for %s. Job #%d." % (PRINTERS[pid].name, jid), "ok")
-    return redirect(url_for("index"))
+    return redirect(url_for("index", p=pid) if pid in PRINTERS else url_for("index"))
 
 
 def _job_or_404(jid):
@@ -741,7 +1015,10 @@ def main():
     if not PRINTERS:
         raise SystemExit("No printers configured. Copy config.example.env to config.env.")
     threading.Thread(target=poller, daemon=True).start()
-    host = os.environ.get("HOST", "0.0.0.0")
+    if HOOKS and DISCORD_BOARD:
+        log.info("Discord: %d server(s), status board on", len(HOOKS))
+        threading.Thread(target=board_loop, daemon=True).start()
+    host =os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8000"))
     try:
         from waitress import serve

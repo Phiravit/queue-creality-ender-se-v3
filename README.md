@@ -36,6 +36,26 @@ who printed what. Anyone who types someone else's ID could act as them. The ID m
 be 6–15 digits; change `STUDENT_ID_PATTERN` in `config.env` (a regular expression)
 to accept only SIT IDs if you know their format.
 
+### Printer password
+
+To keep a printer (e.g. the Research printer) for people you've told, set
+`PRINTER2_PASSWORD=...` in `config.env`. Students then need that password to queue
+on it. Each student types it once: after that it's remembered for their student ID on
+every device. Changing the password asks everyone again. Staff never need it. Plate
+clearing stays open to everyone at the printer.
+
+### Printer tabs
+
+The student page shows one printer at a time, with a tab per printer at the top
+(each tab shows a live status, e.g. "Printing 42% · 2 waiting"). Each printer has
+its own "Add a print" form, so there's no printer to pick from a list. The page
+remembers the last tab a student used. The staff page still shows every printer.
+
+### Night mode
+
+The page follows the device's dark/light setting. The moon/sun button in the header
+switches it, and the choice is remembered on that device.
+
 ## Jobs
 
 Students can only remove or cancel their **own** jobs.
@@ -96,15 +116,27 @@ Everything so far was tested against a fake OctoPrint. Before letting students u
 
 1. In Discord: the channel's **Edit Channel > Integrations > Webhooks > New Webhook >
    Copy Webhook URL**.
-2. Paste it as `DISCORD_WEBHOOK_URL` in `config.env` and restart:
+2. Paste it as `DISCORD1_WEBHOOK_URL` in `config.env` and restart:
    `sudo systemctl restart print-queue`.
-3. Optional: `DISCORD_STAFF_ROLE_ID` pings a staff role on errors only. (In Discord,
+3. Optional: `DISCORD1_STAFF_ROLE_ID` pings a staff role on errors only. (In Discord,
    turn on Developer Mode, then right-click the role and choose **Copy Role ID**.)
 
-Alerts are sent when a print starts, finishes (with a reminder to clear the plate),
-is stopped, or fails, when a printer locks because of an error, and when someone
-prints outside the queue. Keep the webhook URL private: anyone who has it can post
-to the channel.
+More servers: add `DISCORD2_WEBHOOK_URL` / `DISCORD2_STAFF_ROLE_ID`, `DISCORD3_...` and
+so on (up to 9). Each webhook gets its own status board; a staff role only works in
+the server it belongs to, so each webhook has its own. `DISCORDn_PRINTERS=2` makes a
+webhook follow only printer 2 (alerts and board); leave it empty for every printer.
+
+Alerts are sent when someone joins a queue, when a print starts, finishes (with a
+reminder to clear the plate and who's next), is stopped, or fails, when a printer
+locks because of an error, and when someone prints outside the queue. Keep the
+webhook URL private: anyone who has it can post to the channel.
+
+**Status board.** The queue also posts one "3D printer status" message and keeps
+editing it: each printer's state, progress, time left and full queue, with a link to
+that printer's tab. It updates at most every 20 s (`DISCORD_BOARD_SECONDS`) and at
+least every 5 minutes, so the "Last updated" time shows whether the queue is alive.
+Pin that message in the channel. If someone deletes it, a new one is posted. Turn it
+off with `DISCORD_STATUS_BOARD=0`.
 
 ## Make the queue the only way in
 

@@ -5,9 +5,9 @@
   <h2>Staff login</h2>
   {% if configured %}
   <form method="post">
-    <label>Password</label>
-    <input type="password" name="password" autocomplete="current-password">
-    <div style="margin-top:12px"><button class="primary">Log in</button></div>
+    <label for="s-pw">Staff password</label>
+    <input type="password" id="s-pw" name="password" autocomplete="current-password" required>
+    <div style="margin-top:14px"><button class="primary block">Log in</button></div>
   </form>
   {% else %}
   <p>No staff password is set. Put <code>ADMIN_PASSWORD=...</code> in <code>config.env</code> and restart the queue.</p>

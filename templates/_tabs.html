@@ -1,0 +1,9 @@
+<nav class="tabs" aria-label="Printers">
+  {% for d in printers %}{% set color, text = d.summary %}
+  <a class="tab" href="{{ url_for('index', p=d.p.id) }}"{% if d.p.id == pid %} aria-current="page"{% endif %}>
+    <span class="tab-name">{{ d.p.name }}</span>
+    <span class="tab-st num"><span class="dot dot-{{ color }}" aria-hidden="true"></span>{{ text }}{% if d.queue %} · {{ d.queue | length }} waiting{% endif %}</span>
+    <span class="tab-free num">{{ d.free[0] }}</span>
+  </a>
+  {% endfor %}
+</nav>

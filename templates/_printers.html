@@ -2,7 +2,12 @@
 {% for d in printers %}
   {% set p = d.p %}{% set row = d.row %}{% set live = d.live %}
   <section class="card" aria-labelledby="pr-{{ p.id }}">
-    <h2 id="pr-{{ p.id }}">{{ p.name }}</h2>
+    <div class="card-h">
+      <h2 id="pr-{{ p.id }}">{{ p.name }}</h2>
+      {% if p.password %}<span class="tag" title="Students need a password from lab staff to queue here"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>{% if printer_unlocked(p) %}Password entered{% else %}Password needed{% endif %}</span>{% endif %}
+    </div>
+    <p class="free num"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+      <b>{{ d.free[0] }}</b>{% if d.free[1] %} <span class="muted">({{ tz_label }}, rough estimate)</span>{% endif %}</p>
 
     {# ---- state: calm states are tinted, states that need a person are solid ---- #}
     {% if live.kind == 'error' %}
@@ -36,7 +41,10 @@
         <span class="muted">{{ d.cur.filename if d.cur else live.file }}</span></div>
       <div class="meter" role="progressbar" aria-label="Print progress" aria-valuemin="0" aria-valuemax="100"
            aria-valuenow="{{ '%.0f' % pct }}"><div style="width: {{ '%.0f' % pct }}%"></div></div>
-      <div class="muted num">{{ '%.0f' % pct }}% · {{ fmt_dur(live.print_time) }} so far · about {{ fmt_dur(live.time_left) }} left</div>
+      <div class="muted num">{% if live.print_time %}{{ '%.0f' % pct }}% · {{ fmt_dur(live.print_time) }} so far{% else %}Starting: heating up and homing…{% endif %}</div>
+      <div class="eta num" title="Estimate from OctoPrint, or from the slicer when OctoPrint has none yet">
+        {% if d.cur_done %}Another <b>{{ fmt_dur(d.cur_done - now) }}</b> · estimated finish <b>{{ fmt_clock(d.cur_done, 60) }}</b> <span class="muted">({{ tz_label }})</span>
+        {% else %}Estimated finish: working it out…{% endif %}</div>
       {% if d.cur and (d.cur.id in mine or is_admin()) %}
         <div class="row">
           {% if live.paused %}
@@ -89,18 +97,17 @@
     {% endif %}
 
     {# ---- queue ---- #}
-    <h3>Queue <span class="muted num">({{ d.queue | length }})</span></h3>
+    <h3>Queue <span class="muted num">({{ d.queue | length }})</span>{% if d.queue %} <span class="muted" style="font-weight:400">· times are {{ tz_label }}, roughly</span>{% endif %}</h3>
     {% if d.queue %}
-    <div class="table-wrap"><table>
-      <tr><th>#</th><th>Who and file</th><th>When</th><th><span class="sr-only">Actions</span></th></tr>
-      {% for j, wait in d.queue %}
-      <tr>
-        <td class="num">{{ loop.index }}</td>
-        <td><b>{{ j.student_name }}</b>{% if is_admin() %} <span class="muted">({{ j.student_id }})</span>{% endif %}<br>
-            <span class="muted">{{ j.filename }}{% if j.note %} · {{ j.note }}{% endif %}</span></td>
-        <td class="num when">{% if row.lock == 'NEEDS_CLEAR' and loop.first %}After the plate is cleared{% else %}In about {{ fmt_dur(wait) }}{% endif %}<br>
-            <span class="muted">{{ fmt_dur(j.est_seconds) }} print</span></td>
-        <td class="acts">
+    <ol class="list q">
+      {% for j, wait, done in d.queue %}
+      <li>
+        <span class="n num">{{ loop.index }}</span>
+        <div class="main"><b>{{ j.student_name }}</b>{% if is_admin() %} <span class="muted num">({{ j.student_id }})</span>{% endif %}<br>
+          <span class="muted">{{ j.filename }}{% if j.note %} · {{ j.note }}{% endif %}</span></div>
+        <div class="when num">{% if row.lock == 'NEEDS_CLEAR' and loop.first %}After the plate is cleared{% elif wait < 60 %}Next{% else %}In about {{ fmt_dur(wait) }}{% endif %}<br>
+          <span class="muted">{{ fmt_dur(j.est_seconds) }} print{% if done %} · done ~{{ fmt_clock(done) }}{% endif %}</span></div>
+        <div class="acts">
           {% if is_admin() %}
             <form class="inline" method="post" action="{{ url_for('admin_move', jid=j.id, direction='up') }}"><button class="small icon" aria-label="Move job {{ j.id }} up" title="Move up"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 15 6-6 6 6"/></svg></button></form>
             <form class="inline" method="post" action="{{ url_for('admin_move', jid=j.id, direction='down') }}"><button class="small icon" aria-label="Move job {{ j.id }} down" title="Move down"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button></form>
@@ -109,23 +116,26 @@
             <form class="inline" method="post" action="{{ url_for('remove_job', jid=j.id) }}"
                   onsubmit="return confirm('Remove job #{{ j.id }} from the queue?')"><button class="small danger">Remove</button></form>
           {% endif %}
-        </td>
-      </tr>
+        </div>
+      </li>
       {% endfor %}
-    </table></div>
+    </ol>
     {% else %}<p class="muted">Nobody is waiting for this printer.</p>{% endif %}
 
     {% if d.recent %}
     <h3>Recently finished</h3>
-    <div class="table-wrap"><table>
+    <ul class="list h">
       {% for j in d.recent %}
-      <tr><td>{{ j.student_name }}<br><span class="muted">{{ j.filename }}</span></td>
-          <td>{% if j.status == 'done' %}<span class="pill p-done">Done</span>
-              {% elif j.status == 'stopped' %}<span class="pill p-stopped">{{ j.result }}</span>
-              {% else %}<span class="pill p-failed">Failed</span><br><span class="muted">{{ j.result }}</span>{% endif %}</td>
-          <td class="muted num">{{ fmt_time(j.finished) }}</td></tr>
+      <li>
+        <div class="main">{{ j.student_name }}<br><span class="muted">{{ j.filename }}</span>
+          {% if j.status == 'failed' %}<br><span class="muted">{{ j.result }}</span>{% endif %}</div>
+        <div class="end">{% if j.status == 'done' %}<span class="pill p-done">Done</span>
+            {% elif j.status == 'stopped' %}<span class="pill p-stopped">{{ j.result }}</span>
+            {% else %}<span class="pill p-failed">Failed</span>{% endif %}<br>
+          <span class="muted num">{{ fmt_time(j.finished) }}</span></div>
+      </li>
       {% endfor %}
-    </table></div>
+    </ul>
     {% endif %}
   </section>
 {% endfor %}

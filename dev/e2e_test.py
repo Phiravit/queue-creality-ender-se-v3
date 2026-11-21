@@ -51,10 +51,10 @@ def gcode(name, minutes):
     return path
 
 
-def submit(s, printer, name, path):
+def submit(s, printer, name, path, pw=""):
     with open(path, "rb") as f:
-        r = s.post(Q + "/submit", data={"printer": printer, "name": name, "student_id": "6500" + name[:3],
-                                        "note": ""}, files={"file": (os.path.basename(path), f)})
+        r = s.post(Q + "/submit", data={"printer": printer, "note": "", "printer_password": pw},
+                   files={"file": (os.path.basename(path), f)})
     assert r.status_code == 200, r.status_code
     return r
 
@@ -73,8 +73,11 @@ data = tempfile.mkdtemp(prefix="pq_")
 env = dict(os.environ, QUEUE_CONFIG=os.path.join(data, "none.env"), DATA_DIR=data, PORT="8765",
            HOST="127.0.0.1", POLL_SECONDS="0.5", START_GRACE_SECONDS="3", ADMIN_PASSWORD="staffpw",
            PRINTER1_NAME="Free Use", PRINTER1_URL=F1, PRINTER1_APIKEY="KEY1",
-           PRINTER2_NAME="Research", PRINTER2_URL=F2, PRINTER2_APIKEY="KEY2",
-           DISCORD_WEBHOOK_URL=F1 + "/fake/webhook", DISCORD_STAFF_ROLE_ID="999", PUBLIC_URL="http://queue.test")
+           PRINTER2_NAME="Research", PRINTER2_URL=F2, PRINTER2_APIKEY="KEY2", PRINTER2_PASSWORD="research-pw",
+           DISCORD_WEBHOOK_URL=F1 + "/fake/webhook", DISCORD_STAFF_ROLE_ID="999", PUBLIC_URL="http://queue.test",
+           DISCORD_BOARD_SECONDS="1",
+           DISCORD2_WEBHOOK_URL="(" + F2 + "/fake/webhook)", DISCORD2_STAFF_ROLE_ID="888",
+           DISCORD2_PRINTERS="2")
 start([os.path.join(HERE, "fake_octoprint.py"), "5101", "KEY1"])
 start([os.path.join(HERE, "fake_octoprint.py"), "5102", "KEY2"])
 time.sleep(1.5)
@@ -124,7 +127,11 @@ try:
     page = alice.get(Q + "/").text
     assert "Printing" in page, page[:3000]
     assert "30m" in page, "slicer estimate"
+    assert "done ~" in page and "times are GMT+7" in page, "queued job shows a GMT+7 finish time"
+    assert "Free by ~" in page and "Free once the plate is cleared" in page, "free-by on card and tabs"
     assert "Cancel print" in page, "owner cancel"
+    wait_until(lambda: "estimated finish" in alice.get(Q + "/?p=1").text, "finish time on the card")
+    assert "(GMT+7)" in alice.get(Q + "/?p=1").text
     assert "Cancel print" not in carol.get(Q + "/").text, "other students must not see cancel"
     alice_phone = login(" 6513 0500001 ")      # returning student: ID only, name remembered
     assert "Alice Wong" in alice_phone.get(Q + "/").text, "name remembered from first sign-in"
@@ -153,19 +160,33 @@ try:
     wait_until(lambda: job_status(2) == "stopped" and lock("1") == "NEEDS_CLEAR", "job 2 stopped")
     ok.append("owner can cancel, others get 403; cancelled print locks printer")
 
-    # 6. Students can only remove their own queued job.
-    submit(alice, "2", "Alice", gcode("alice2.gcode", 10))
+    # 6. Research printer: password once per student (any device); tabs; remove own job only.
+    page = alice.get(Q + "/?p=2").text
+    assert "Password needed" in page and 'name="printer_password"' in page
+    assert 'aria-current="page"' in page and "Add a print to Research" in page, "tab for printer 2"
+    r = submit(alice, "2", "Alice", gcode("alice2.gcode", 10), pw="wrong")
+    assert "Wrong password" in r.text, r.text[:2000]
+    r = submit(alice, "2", "Alice", gcode("alice2.gcode", 10), pw="research-pw")
+    assert "Job #3" in r.text, r.text[:2000]
+    page = alice.get(Q + "/").text                       # remembers the last printer tab
+    assert "Add a print to Research" in page and "Password entered" in page
+    assert 'name="printer_password"' not in page
+    alice_tablet = login("65130500001")
+    assert 'name="printer_password"' not in alice_tablet.get(Q + "/?p=2").text, "remembered per student"
+    assert 'name="printer_password"' in bob.get(Q + "/?p=2").text, "other students still need it"
+    assert 'name="printer_password"' not in bob.get(Q + "/?p=1").text, "printer 1 has no password"
     assert bob.post(Q + "/job/3/remove").status_code == 403
     alice.post(Q + "/job/3/remove")
     assert job_status(3) == "removed"
-    ok.append("remove: own job only")
+    ok.append("printer tabs; research password: wrong refused, asked once per student; remove own job only")
 
     # 7. A print started directly in OctoPrint is detected and locks after.
     clear(carol, "2")
     wait_until(lambda: lock("2") == "READY", "printer 2 ready")
     requests.post(F2 + "/fake/external")
     wait_until(lambda: lock("2") == "BUSY", "external print noticed")
-    assert "Not from the queue" in carol.get(Q + "/").text
+    assert "Not from the queue" in carol.get(Q + "/?p=2").text
+    wait_until(lambda: "estimated finish" in carol.get(Q + "/?p=2").text, "finish time for an outside print")
     wait_until(lambda: lock("2") == "NEEDS_CLEAR", "lock after external print")
     ok.append("print started outside the queue is detected and locks afterwards")
 
@@ -177,11 +198,11 @@ try:
     time.sleep(1)
     requests.post(F2 + "/fake/error")
     wait_until(lambda: job_status(4) == "failed", "job 4 failed")
-    page = carol.get(Q + "/").text
+    page = carol.get(Q + "/?p=2").text
     assert "Printer error" in page and "Thermal Runaway" in page, page[page.find("Research"):][:1500]
     requests.post(F2 + "/fake/blackout/0.8")
     time.sleep(0.9)
-    assert "Thermal Runaway" in carol.get(Q + "/").text, "a short outage must not hide a printer error"
+    assert "Thermal Runaway" in carol.get(Q + "/?p=2").text, "a short outage must not hide a printer error"
     clear(carol, "2")
     assert lock("2") == "NEEDS_CLEAR", "students cannot clear a printer that is in error"
     ok.append("printer error: job failed, error shown, students cannot unlock")
@@ -217,9 +238,9 @@ try:
     time.sleep(1.5)
     requests.post(F1 + "/fake/blackout/4.0")
     time.sleep(0.6)
-    assert "Can't reach this printer" not in carol.get(Q + "/").text, "one blip must not turn the page red"
+    assert "Can't reach this printer" not in carol.get(Q + "/?p=1").text, "one blip must not turn the page red"
     time.sleep(2.2)
-    page = carol.get(Q + "/").text
+    page = carol.get(Q + "/?p=1").text
     assert "Can't reach this printer" in page and "probably still running" in page
     assert job_status(6) == "printing" and lock("1") == "BUSY"
     wait_until(lambda: job_status(6) == "done", "job 6 done after contact came back", timeout=30)
@@ -238,7 +259,29 @@ try:
     assert not any(t.startswith("<@&") for t in texts if "is done" in t), "no staff ping on normal finish"
     assert any("directly in OctoPrint" in t for t in texts)
     assert any("was stopped at" in t for t in texts)
-    ok.append("Discord alerts: finished / stopped / outside-queue / failed (+staff ping)")
+    assert "Next up: Bob's bob.gcode" in done[0], done[0]
+    started = [t for t in texts if "started Alice Wong's alice.gcode" in t]
+    assert started and "done around" in started[0] and "GMT+7" in started[0], started
+    assert any("joined the queue" in t and "done around" in t for t in texts)
+    assert any("joined the queue" in t and "alice.gcode" in t and "first in line" in t for t in texts), texts
+    boards = [m for m in msgs if m["content"].startswith("**3D printer status**")]
+    assert len(boards) == 1, "the status board is one message, edited in place"
+    b = boards[0]
+    assert b.get("edits", 0) >= 3 and len(b["embeds"]) == 2, b
+    assert b["embeds"][0]["title"] == "Free Use" and b["embeds"][0]["fields"][0]["name"].startswith("Queue (")
+    assert b["embeds"][0]["url"] == "http://queue.test/?p=1"
+    assert "🕒 " in b["embeds"][0]["description"], b["embeds"][0]["description"]
+    # A second webhook that only follows printer 2: its alerts, its own role, a board with just printer 2.
+    msgs2 = requests.get(F2 + "/fake/messages").json()
+    texts2 = [m["content"] for m in msgs2]
+    assert not any("**Free Use**" in t for t in texts2), "printer 1 alerts must not reach a printer-2 webhook"
+    assert any("directly in OctoPrint" in t for t in texts2), texts2
+    failed2 = [m for m in msgs2 if "FAILED" in m["content"]]
+    assert failed2 and failed2[0]["content"].startswith("<@&888>") and failed2[0]["allowed_mentions"]["roles"] == ["888"]
+    boards2 = [m for m in msgs2 if m["content"].startswith("**3D printer status**")]
+    assert len(boards2) == 1 and [e["title"] for e in boards2[0]["embeds"]] == ["Research"], boards2
+    assert "http://queue.test/?p=2" in failed2[0]["content"], "alert links to that printer's tab"
+    ok.append("Discord: alerts (+next up, joined queue, staff ping per server) and one live board; per-printer webhook")
 
     # 13. Wrong file type refused.
     r = alice.post(Q + "/submit", data={"printer": "1", "name": "A", "student_id": "1"},
