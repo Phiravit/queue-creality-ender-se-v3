@@ -59,6 +59,19 @@ switches it, and the choice is remembered on that device.
 ## Jobs
 
 Students can only remove or cancel their **own** jobs.
+
+### Timed prints
+
+The add form asks **When should it print?**: *Right away*, *Timer* (e.g. 1 hour from
+now) or *Date & time* (lab time, GMT+7, up to `MAX_BOOK_DAYS` days ahead, default 7).
+Once a file is chosen, the form shows when it would be done, so the student knows when
+to pick it up. After adding, the message and the queue show the start and finish times.
+
+A timed print starts at that time **at the earliest**. It doesn't hold the printer:
+jobs behind it go ahead while it waits, and a "right away" print added before its time
+can push it back. It still needs the plate confirmed clear, so a print timed for the
+night only starts if someone cleared the plate before leaving (and a queue restart
+locks the printer again).
 A print started directly in OctoPrint (not through the queue) is still detected: the
 printer shows as busy and locks afterwards.
 

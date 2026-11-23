@@ -79,6 +79,8 @@ BOARD_MIN_EDIT = float(os.environ.get("DISCORD_BOARD_SECONDS", "20"))   # at mos
 TZ_HOURS = float(os.environ.get("TIMEZONE_OFFSET_HOURS", "7"))
 LOCAL_TZ = timezone(timedelta(hours=TZ_HOURS))
 TZ_LABEL = "GMT%+g" % TZ_HOURS
+MAX_BOOK_DAYS = float(os.environ.get("MAX_BOOK_DAYS", "7"))   # how far ahead a print can be timed
+SWAP = 300   # rough minutes between prints: someone has to clear the plate
 # Students sign in with their student ID (and their full name the first time).
 STUDENT_ID_RE = re.compile(os.environ.get("STUDENT_ID_PATTERN", r"^[0-9]{6,15}$"))
 
@@ -259,6 +261,9 @@ def init_db():
             student_id TEXT NOT NULL, printer TEXT NOT NULL, token TEXT NOT NULL,
             PRIMARY KEY(student_id, printer));
         """)
+        # added later: the earliest time a job may start (NULL = as soon as possible)
+        if "start_after" not in [r[1] for r in c.execute("PRAGMA table_info(jobs)")]:
+            c.execute("ALTER TABLE jobs ADD COLUMN start_after REAL")
         for pid in PRINTERS:
             c.execute("INSERT OR IGNORE INTO printers(id, lock, lock_reason) VALUES(?,?,?)",
                       (pid, "NEEDS_CLEAR", "Queue just started: check the plate is empty."))
@@ -395,8 +400,10 @@ def poll_printer(p):
             return
 
         if lock == "READY" and not row["queue_paused"] and st["ready"]:
+            # first in line whose start time has come; later timed jobs don't hold anyone up
             start_job = c.execute("SELECT * FROM jobs WHERE printer=? AND status='queued' "
-                                  "ORDER BY sort, id LIMIT 1", (p.id,)).fetchone()
+                                  "AND (start_after IS NULL OR start_after<=?) "
+                                  "ORDER BY sort, id LIMIT 1", (p.id, time.time())).fetchone()
 
     if start_job:
         launch(p, start_job)
@@ -431,12 +438,32 @@ def launch(p, job):
 
 
 def next_up(c, pid):
-    j = c.execute("SELECT * FROM jobs WHERE printer=? AND status='queued' ORDER BY sort, id LIMIT 1",
-                  (pid,)).fetchone()
-    if not j:
+    jobs = c.execute("SELECT * FROM jobs WHERE printer=? AND status='queued' ORDER BY sort, id",
+                     (pid,)).fetchall()
+    if not jobs:
         return "Nobody is waiting for this printer."
-    n = c.execute("SELECT COUNT(*) FROM jobs WHERE printer=? AND status='queued'", (pid,)).fetchone()[0]
-    return "Next up: %s%s." % (who(j), " (+%d more waiting)" % (n - 1) if n > 1 else "")
+    j, _wait, _done = plan(jobs, time.time())[0]
+    later = j["start_after"] and j["start_after"] > time.time() + 60
+    return "Next up: %s%s%s." % (who(j), " (timed for %s %s)" % (fmt_clock(j["start_after"], 60), TZ_LABEL)
+                                 if later else "",
+                                 " (+%d more waiting)" % (len(jobs) - 1) if len(jobs) > 1 else "")
+
+
+def plan(jobs, free_at):
+    """Walk the clock through the queue the way the poller will: at each moment the
+    first job in line whose start time has come goes next; if none has, skip ahead to
+    the earliest start time. Returns (job, start, estimated finish or None) in print order."""
+    pending, t, out = list(jobs), free_at, []
+    while pending:
+        due = [j for j in pending if not j["start_after"] or j["start_after"] <= t]
+        if not due:
+            t = min(j["start_after"] for j in pending)
+            continue
+        j = due[0]
+        pending = [x for x in pending if x["id"] != j["id"]]
+        out.append((j, t, t + j["est_seconds"] if j["est_seconds"] else None))
+        t += (j["est_seconds"] or 0) + SWAP
+    return out
 
 
 def poller():
@@ -471,10 +498,11 @@ def board_payload():
         elif row["lock"] == "NEEDS_CLEAR" or colour == "bad":
             lines.append(live.get("error") or live.get("text") if colour == "bad" else row["lock_reason"])
         q = d["queue"]
-        qtext = "\n".join("%d. %s · `%s` (%s)" % (i + 1, j["student_name"], j["filename"],
-                                                  fmt_dur(j["est_seconds"]) + (
-                                                      ", done ~%s" % fmt_clock(done) if done else ""))
-                          for i, (j, _w, done) in enumerate(q[:10])) or "Nobody is waiting."
+        qtext = "\n".join("%d. %s · `%s` (%s%s)" % (
+            i + 1, j["student_name"], j["filename"],
+            "⏰ starts ~%s, " % fmt_clock(time.time() + w, 60) if j["start_after"] and w > 60 else "",
+            fmt_dur(j["est_seconds"]) + (", done ~%s" % fmt_clock(done) if done else ""))
+            for i, (j, w, done) in enumerate(q[:10])) or "Nobody is waiting."
         if len(q) > 10:
             qtext += "\n…and %d more" % (len(q) - 10)
         e = {"title": p.name[:250], "color": BOARD_COLOURS[colour],
@@ -655,6 +683,12 @@ def free_info(row, live, cur_done, rows):
         return "Out of service until staff fix it", None
     if row["queue_paused"] and rows:
         return "Queue paused by staff", None
+    if rows and rows[0][1] > 600 and row["lock"] != "BUSY":
+        # only timed prints are waiting, and the first one is a while off
+        first = time.time() + rows[0][1]
+        return "%s until ~%s, when a timed print starts" % (
+            "Free now" if row["lock"] == "READY" else "Free once the plate is cleared",
+            fmt_clock(first, 60)), first
     if rows:
         last = rows[-1][2]
         if last and all(r[2] for r in rows):
@@ -721,12 +755,9 @@ def view_data(only=None):
                 elif cur and cur["est_seconds"] and cur["started"]:
                     left = max(60, cur["started"] + cur["est_seconds"] - now)
             left = left if row["lock"] == "BUSY" else None
-            wait = left or 0
-            # each queued job: (job, seconds until it starts, estimated finish time or None)
-            rows = []
-            for j in queue:
-                rows.append((j, wait, now + wait + j["est_seconds"] if j["est_seconds"] else None))
-                wait += (j["est_seconds"] or 0) + 300   # +5 min to swap prints
+            # each queued job, in the order it will print:
+            # (job, seconds until it starts, estimated finish time or None)
+            rows = [(j, start - now, done) for j, start, done in plan(queue, now + (left or 0))]
             cur_done = now + left if left else None
             out.append({"p": p, "row": row, "live": live, "cur": cur,
                         "queue": rows, "recent": recent, "cur_done": cur_done,
@@ -811,9 +842,17 @@ def too_big(_e):
 def index():
     pid = selected_printer()
     printers = view_data()
+    lab_now = datetime.now(LOCAL_TZ).replace(second=0, microsecond=0)
+    pick = (lab_now + timedelta(hours=1)).replace(minute=0)   # date picker starts at the next full hour
+    if pick <= lab_now:
+        pick += timedelta(hours=1)
+    fmt = "%Y-%m-%dT%H:%M"
     return render_template("index.html", printers=printers, pid=pid, p=PRINTERS[pid],
                            shown=[d for d in printers if d["p"].id == pid],
-                           mine=my_jobs(), max_mb=MAX_UPLOAD_MB)
+                           mine=my_jobs(), max_mb=MAX_UPLOAD_MB, max_days=MAX_BOOK_DAYS,
+                           tz_hours=TZ_HOURS, book_min=lab_now.strftime(fmt),
+                           book_max=(lab_now + timedelta(days=MAX_BOOK_DAYS)).strftime(fmt),
+                           book_default=pick.strftime(fmt))
 
 
 @app.get("/partial")
@@ -827,14 +866,44 @@ def partial():
                            printers=view_data(pid if pid in PRINTERS else None))
 
 
+def parse_start(form):
+    """'When should it print?': (earliest start time or None for now, error text or None).
+    The timer counts from the server's clock; the date picker is read as lab time (GMT+7)."""
+    when, now = form.get("when", "now"), time.time()
+    if when == "in":
+        try:
+            hours = float(form.get("in_hours", "").replace(",", "."))
+        except ValueError:
+            return None, "Type how many hours from now, e.g. 1 or 2.5."
+        if not 0 <= hours <= MAX_BOOK_DAYS * 24:
+            return None, "Pick a time within the next %g days." % MAX_BOOK_DAYS
+        start = now + hours * 3600
+    elif when == "at":
+        try:
+            start = datetime.strptime(form.get("at_time", ""), "%Y-%m-%dT%H:%M") \
+                .replace(tzinfo=LOCAL_TZ).timestamp()
+        except ValueError:
+            return None, "Pick a date and time."
+        if start < now - 120:
+            return None, "That time has already passed. Pick a later one, or choose 'Right away'."
+        if start > now + MAX_BOOK_DAYS * 86400:
+            return None, "Pick a time within the next %g days." % MAX_BOOK_DAYS
+    else:
+        return None, None
+    return (start if start > now + 60 else None), None
+
+
 @app.post("/submit")
 def submit():
     pid = request.form.get("printer", "")
     name, sid = session.get("name") or "Staff", user_sid() or "staff"
     note = request.form.get("note", "").strip()[:200]
     f = request.files.get("file")
+    start_after, when_err = parse_start(request.form)
     if pid not in PRINTERS:
         flash("Pick a printer.", "bad")
+    elif when_err:
+        flash(when_err, "bad")
     elif not f or not f.filename:
         flash("Choose a G-code file.", "bad")
     elif not f.filename.lower().endswith(ALLOWED_EXT):
@@ -850,20 +919,32 @@ def submit():
         est = estimate_seconds(path)
         with tx() as c:
             cur = c.execute("INSERT INTO jobs(printer, student_name, student_id, note, "
-                            "filename, stored, est_seconds, sort, created) "
-                            "VALUES(?,?,?,?,?,?,?,?,?)",
+                            "filename, stored, est_seconds, sort, created, start_after) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?)",
                             (pid, name, sid, note, f.filename[:120], stored, est,
-                             time.time(), time.time()))
+                             time.time(), time.time(), start_after))
             jid = cur.lastrowid
-            event(c, pid, "Job #%d queued by %s (%s): %s" % (jid, name, sid, f.filename))
-            ahead = c.execute("SELECT COUNT(*) FROM jobs WHERE printer=? AND status IN "
-                              "('queued','printing') AND id<>?", (pid, jid)).fetchone()[0]
-        done = next((x[2] for d in view_data(pid) for x in d["queue"] if x[0]["id"] == jid), None)
-        notify(pid, "📥 **%s**: %s joined the queue (%s, about %s%s)." % (
-            PRINTERS[pid].name, "%s's `%s`" % (name, f.filename[:120]),
+            event(c, pid, "Job #%d queued by %s (%s): %s%s" % (
+                jid, name, sid, f.filename,
+                ", start at %s" % fmt_time(start_after) if start_after else ""))
+        d = view_data(pid)[0]
+        order = [x[0]["id"] for x in d["queue"]]
+        wait, done = next((x[1], x[2]) for x in d["queue"] if x[0]["id"] == jid)
+        ahead = order.index(jid) + (d["row"]["lock"] == "BUSY")
+        timed = "timed for %s, " % fmt_clock(start_after, 60) if start_after else ""
+        notify(pid, "📥 **%s**: %s joined the queue (%s%s, about %s%s)." % (
+            PRINTERS[pid].name, "%s's `%s`" % (name, f.filename[:120]), timed,
             "%d ahead" % ahead if ahead else "first in line", fmt_dur(est),
             ", done around %s %s" % (fmt_clock(done), TZ_LABEL) if done else ""))
-        flash("Added to the queue for %s. Job #%d." % (PRINTERS[pid].name, jid), "ok")
+        msg = "Added to the queue for %s (job #%d)." % (PRINTERS[pid].name, jid)
+        if done:
+            msg += (" It should start around %s and be done around %s (%s): pick it up then."
+                    " Rough times: it waits if the plate isn't cleared." % (
+                        fmt_clock(time.time() + wait, 60), fmt_clock(done), TZ_LABEL))
+        elif start_after:
+            msg += " It starts around %s (%s) at the earliest. The file has no time estimate, " \
+                   "so there's no finish time." % (fmt_clock(time.time() + wait, 60), TZ_LABEL)
+        flash(msg, "ok")
     return redirect(url_for("index", p=pid) if pid in PRINTERS else url_for("index"))
 
 

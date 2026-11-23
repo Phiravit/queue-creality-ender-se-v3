@@ -16,6 +16,27 @@
       {% endif %}
       <label for="f-file">G-code file <span class="hint">(sliced for this printer, up to {{ max_mb }} MB)</span></label>
       <input type="file" id="f-file" name="file" accept=".gcode,.gco,.g" required>
+      <fieldset class="when">
+        <legend>When should it print?</legend>
+        <div class="seg">
+          <label><input type="radio" name="when" value="now" checked autocomplete="off"><span>Right away</span></label>
+          <label><input type="radio" name="when" value="in" autocomplete="off"><span>Timer</span></label>
+          <label><input type="radio" name="when" value="at" autocomplete="off"><span>Date &amp; time</span></label>
+        </div>
+        <div class="when-opt" data-when="in">
+          <label for="f-hours">Start in</label>
+          <div class="hours">
+            <input type="number" id="f-hours" name="in_hours" value="1" min="0.25" max="{{ '%g' % (max_days * 24) }}" step="0.25" inputmode="decimal" required>
+            <span>hours from now</span>
+          </div>
+          <div class="chips">{% for h in (1, 2, 4, 8, 12) %}<button type="button" class="small" data-hours="{{ h }}">{{ h }} h</button>{% endfor %}</div>
+        </div>
+        <div class="when-opt" data-when="at">
+          <label for="f-at">Start at <span class="hint">({{ tz_label }}, up to {{ '%g' % max_days }} days ahead)</span></label>
+          <input type="datetime-local" id="f-at" name="at_time" value="{{ book_default }}" min="{{ book_min }}" max="{{ book_max }}" step="300" required>
+        </div>
+        <p class="when-note num" id="when-note" aria-live="polite"></p>
+      </fieldset>
       <label for="f-note">Note <span class="hint">(optional, e.g. filament colour)</span></label>
       <input type="text" id="f-note" name="note" maxlength="200">
       <div style="margin-top:14px"><button class="primary block" data-busy="Uploading…" data-label="Add to queue">Add to queue</button></div>
@@ -23,6 +44,90 @@
     <p class="muted">When your print is done, take it off the plate, then press
       <b>Plate is clear</b> so the next person's print can start.
       You can remove or cancel your own jobs from any device you're signed in on.</p>
+    <p class="muted">A timed print starts at that time at the earliest. If the printer is busy
+      then, or nobody has cleared the plate, it starts as soon as that's done.</p>
   </section>
 </div>
+<script>
+  // "When should it print?": show only the chosen option (hidden inputs are disabled, so
+  // they're neither checked nor sent) and preview the start and pickup time in lab time.
+  (() => {
+    const form = document.querySelector('#add form');
+    const note = document.getElementById('when-note');
+    const hours = document.getElementById('f-hours'), at = document.getElementById('f-at');
+    const TZ = {{ tz_hours }}, LABEL = '{{ tz_label }}';
+    let est = null;   // the slicer's print time in seconds, read from the chosen file
+
+    const lab = ms => new Date(ms + TZ * 3600e3);   // read with getUTC*: lab clock
+    const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const clock = ms => {
+      const d = lab(ms), today = lab(Date.now()), pad = n => String(n).padStart(2, '0');
+      const hm = pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes());
+      const days = Math.round((Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) -
+                    Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate())) / 864e5);
+      return days === 0 ? hm : days === 1 ? 'tomorrow ' + hm : DAYS[d.getUTCDay()] + ' ' + d.getUTCDate() + '/' + (d.getUTCMonth() + 1) + ' ' + hm;
+    };
+    const dur = s => { const h = Math.floor(s / 3600), m = Math.round(s % 3600 / 60);
+                       return h ? h + 'h ' + String(m).padStart(2, '0') + 'm' : m + 'm'; };
+    const startMs = when => {
+      if (when === 'in') { const h = parseFloat(hours.value); return h > 0 ? Date.now() + h * 3600e3 : null; }
+      if (when === 'at' && at.value) {       // typed as lab time
+        const [d, t] = at.value.split('T'), [y, mo, da] = d.split('-').map(Number), [hh, mi] = t.split(':').map(Number);
+        return Date.UTC(y, mo - 1, da, hh, mi) - TZ * 3600e3;
+      }
+      return null;
+    };
+
+    function update() {
+      const when = form.querySelector('input[name=when]:checked').value;
+      form.querySelectorAll('.when-opt').forEach(box => {
+        const on = box.dataset.when === when;
+        box.hidden = !on;
+        box.querySelectorAll('input').forEach(i => i.disabled = !on);
+      });
+      const s = startMs(when);
+      const takes = est ? 'The print takes about ' + dur(est) + '. ' : '';
+      if (when === 'now') {
+        note.textContent = takes + 'It joins the end of the queue; you\'ll see its finish time after you add it.';
+      } else if (!s) {
+        note.textContent = '';
+      } else if (s < Date.now() - 120e3) {
+        note.textContent = 'That time has already passed.';
+      } else {
+        note.innerHTML = 'Starts <b>' + clock(s) + '</b> at the earliest' +
+          (est ? ', done around <b>' + clock(s + est * 1000) + '</b>' : '') + ' (' + LABEL + ').' +
+          (est ? '' : ' Choose your file to see the pickup time.');
+      }
+    }
+
+    // Read the slicer's estimate the same way the queue does (Cura ;TIME:, PrusaSlicer/Orca).
+    async function readEstimate(file) {
+      const head = await file.slice(0, 65536).text();
+      const tail = await file.slice(Math.max(0, file.size - 65536)).text();
+      let m = head.match(/;TIME:(\d+)/);
+      if (m) return +m[1];
+      m = (head + tail).match(/estimated printing time[^=]*=\s*([^\n\r]+)/);
+      if (!m) return null;
+      let total = 0;
+      for (const [, n, u] of m[1].matchAll(/(\d+)\s*([dhms])/g)) total += n * { d: 86400, h: 3600, m: 60, s: 1 }[u];
+      return total || null;
+    }
+    document.getElementById('f-file').addEventListener('change', async e => {
+      const f = e.target.files[0];
+      est = null;
+      if (f) try { est = await readEstimate(f); } catch (err) {}
+      update();
+    });
+    form.querySelectorAll('[data-hours]').forEach(b => b.addEventListener('click', () => {
+      hours.value = b.dataset.hours; update(); }));
+    form.addEventListener('input', update);
+    form.addEventListener('change', update);
+    setInterval(update, 30000);   // keep "in 1 hour" honest while the page stays open
+    // Always start on "Right away", even when the browser restores the last choice
+    // (going back, or reopening the page after adding a timed print).
+    const reset = () => { form.querySelector('input[name=when][value=now]').checked = true; update(); };
+    window.addEventListener('pageshow', reset);
+    reset();
+  })();
+</script>
 {% endblock %}

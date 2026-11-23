@@ -29,7 +29,8 @@
       <div class="state s-paused">Queue paused by staff<p>Jobs stay in the queue until staff resume it.</p></div>
     {% else %}
       <div class="state s-ready">Ready
-        <p>{% if d.queue %}The next job starts in a few seconds.{% else %}Nobody is waiting. Add a file below and it prints right away.{% endif %}</p></div>
+        <p>{% if d.queue and d.queue[0][1] > 60 %}Nothing is due yet: the next timed print starts at {{ fmt_clock(now + d.queue[0][1], 60) }}. A print added for "right away" starts now.
+        {% elif d.queue %}The next job starts in a few seconds.{% else %}Nobody is waiting. Add a file below and it prints right away.{% endif %}</p></div>
     {% endif %}
 
     {% if row.queue_paused and row.lock != 'READY' %}<p class="muted">Queue is paused by staff.</p>{% endif %}
@@ -105,7 +106,8 @@
         <span class="n num">{{ loop.index }}</span>
         <div class="main"><b>{{ j.student_name }}</b>{% if is_admin() %} <span class="muted num">({{ j.student_id }})</span>{% endif %}<br>
           <span class="muted">{{ j.filename }}{% if j.note %} · {{ j.note }}{% endif %}</span></div>
-        <div class="when num">{% if row.lock == 'NEEDS_CLEAR' and loop.first %}After the plate is cleared{% elif wait < 60 %}Next{% else %}In about {{ fmt_dur(wait) }}{% endif %}<br>
+        <div class="when num">{% if j.start_after and wait > 60 %}<span class="timed" title="Timed print: starts at this time at the earliest"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2 2M9 2h6"/></svg>Starts ~{{ fmt_clock(now + wait, 60) }}</span>
+          {%- elif row.lock == 'NEEDS_CLEAR' and loop.first %}After the plate is cleared{% elif wait < 60 %}Next{% else %}In about {{ fmt_dur(wait) }}{% endif %}<br>
           <span class="muted">{{ fmt_dur(j.est_seconds) }} print{% if done %} · done ~{{ fmt_clock(done) }}{% endif %}</span></div>
         <div class="acts">
           {% if is_admin() %}
